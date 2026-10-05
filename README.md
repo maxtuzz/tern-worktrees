@@ -25,12 +25,45 @@ Open the palette in a shell inside a git repository:
 
 | Command | What it does |
 | --- | --- |
-| **New worktree session…** | Opens a dialog for the branch name and base. Runs `git worktree add` at `../{repo}.worktrees/{slug}`, opens a Tern session named `{repo}:{branch}` in it, and types the `post_create` setup into its first pane. If the branch already exists, the existing branch is checked out. If the branch already has a worktree, that worktree's session opens. |
+| **New worktree session…** | Opens a dialog for the branch name and base. Leave the branch blank to get the next free autoname (see below). Runs `git worktree add` at `../{repo}.worktrees/{slug}`, opens a Tern session named `{repo}:{branch}` in it, and types the `post_create` setup into its first pane. If the branch already exists, the existing branch is checked out. If the branch already has a worktree, that worktree's session opens. |
 | **Open worktree…** | Lists the repository's worktrees. Picking one switches to its session, or creates the session if there isn't one. |
 | **Bind this session to its worktree** | Binds the current session to the focused pane's worktree. Use it for worktrees you made by hand. |
 | **Re-run setup** | Types `post_create` into the focused shell again. |
 | **Remove worktree…** | Picks a linked worktree, shows what removal will cost (uncommitted changes, unpushed commits, the session it closes), then runs `pre_remove`, `git worktree remove` and closes the session. The branch is kept. |
 | **Prune worktrees** | Drops tracked entries whose folder is gone and runs `git worktree prune`. |
+
+### Autonames
+
+A worktree created without a branch name, from a blank dialog or from Carly, is named after a sea creature from a fixed pool of 40: `pearlfish`, `manatee`, `murex`, `halfbeak`, `narwhal`, and so on. The plain word is the branch, so the session is short (`studio:manatee`). `branch_prefix` still applies.
+
+A name is skipped if it is already one of the following for this repository:
+- a local branch;
+- a worktree folder name;
+- a Tern session name (in Tern or tracked by the plugin).
+
+The rotation cursor is kept in `tern.kv` (`autoname_cursor`), so successive worktrees don't all start at the first animal. When every name is taken, numbered names follow (`pearlfish-2`, …).
+
+### Carly
+
+On desktop, the window half exports two functions to Carly. Carly can find them with `help("plugins.worktrees")`.
+
+```lua
+-- Next autoname, from the configured base (or HEAD), in the focused pane's repository:
+await(plugins.worktrees.create())
+-- Explicit branch and base, in another repository:
+await(plugins.worktrees.create("feat/login", "origin/main", "~/src/studio"))
+--> "Created worktree feat/login at /…/studio.worktrees/feat-login (base origin/main);
+--    session studio:feat/login; post_create setup started in its first pane"
+
+await(plugins.worktrees.list())  -- {{path, branch, main, locked, session}, …}
+```
+
+`create(branch?, base?, dir?)` follows the same path as the dialog:
+- It runs `git worktree add` at the sibling path and opens the `{repo}:{branch}` session.
+- It types `post_create` into that session's pane and runs `post_open_actions`.
+- If the branch already has a worktree, that worktree is reused.
+
+A missing `base` means the first configured `base` ref that exists, else `HEAD`. A missing `dir` means the focused pane's directory. The call answers within 120 s with one line naming the path, branch, session and whether setup started. Failures (an invalid branch, an existing path, a git error) fail the call with the reason.
 
 The status line shows `⎇ branch` for panes inside a tracked worktree, followed by `●n` when there are uncommitted changes. Click it to open the worktree list. Shells started inside a tracked worktree get `TERN_WT_ROOT`, `TERN_WT_MAIN` and `TERN_WT_BRANCH`.
 
@@ -111,7 +144,7 @@ Steps compile to one bash script in the plugin's data folder. It runs in the ses
 
 ## How it works
 
-- **Window half** (`window.luau`): registers the palette commands, the `tern-worktrees://` link route and the status segment. Its load requires only `lib/state`, and the rest loads on first use, which keeps it inside the 50 ms budget. All git runs through async `tern.process.run`.
+- **Window half** (`window.luau`): registers the palette commands, the Carly exports, the `tern-worktrees://` link route and the status segment. Its load requires only `lib/state`, and the rest loads on first use, which keeps it inside the 50 ms budget. All git runs through async `tern.process.run`.
 - **Host half** (`host.luau`): provides the dialog blocks `worktrees.new` and `worktrees.pick`, and the `spawn` filter. The filter only reads an in-memory index refreshed from `tern.kv`, and never runs git.
 - **Dialog → window**: a block answers with `cx:open("tern-worktrees://create?token=…")`, and the window's `tern.route.link` handles it. Each dialog carries a one-shot token issued by the window. A link without a live token does nothing, so a clicked link in terminal output can't create or remove anything.
 - **State**: `tern.kv` key `worktrees` maps each worktree path to `{session_name, session_id, branch, main, …}`. Sessions are found again by name after a daemon restart.
@@ -126,7 +159,7 @@ tern plugin types .   # regenerate tern.d.luau after upgrading Tern
 ## Known gaps (v2)
 
 - The `services` phase is validated but not run yet. There is no "Start services" command.
-- Remote Tern hosts, GitHub PR → worktree, a `tern-wt` CLI bridge and Carly export are out of scope.
+- Remote Tern hosts, GitHub PR → worktree and a `tern-wt` CLI bridge are out of scope.
 - The busy check before removal only sees panes of the session currently shown.
 - Removal keeps the branch. Deleting it is not offered yet.
 

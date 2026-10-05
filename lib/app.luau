@@ -51,6 +51,23 @@ function app.focused_cwd(cx: WindowCx): string?
 	return nil
 end
 
+-- Reads the repository holding `dir` and its config: `cb(repo, cfg, nil,
+-- cx)`, or `cb(nil, nil, why, cx)` when there is none or the config is bad.
+function app.repo_at(dir: string, cb: (git.Repo?, config.Config?, string?, WindowCx?) -> ())
+	git.repo(dir, function(repo, err, cx)
+		if repo == nil then
+			cb(nil, nil, (err or "no repository") .. " · " .. app.tilde(dir), cx)
+			return
+		end
+		local ok, cfg = pcall(config.load, repo.main)
+		if not ok then
+			cb(nil, nil, "Worktrees config is invalid: " .. tostring(cfg), cx)
+			return
+		end
+		cb(repo, cfg, nil, cx)
+	end)
+end
+
 -- Calls `fn(cx, repo, cfg)` for the repository of the focused pane, toasting
 -- why when there is none or its config is malformed.
 function app.with_repo(cx: WindowCx, fn: (WindowCx, git.Repo, config.Config) -> ())
@@ -59,17 +76,12 @@ function app.with_repo(cx: WindowCx, fn: (WindowCx, git.Repo, config.Config) -> 
 		cx:toast("error", "No directory here", "Focus a shell inside a git repository")
 		return
 	end
-	git.repo(cwd, function(repo, err, cx2)
+	app.repo_at(cwd, function(repo, cfg, why, cx2)
 		if cx2 == nil then
 			return
 		end
-		if repo == nil then
-			cx2:toast("error", "Worktrees: no repository", (err or "") .. " · " .. app.tilde(cwd))
-			return
-		end
-		local ok, cfg = pcall(config.load, repo.main)
-		if not ok then
-			cx2:toast("error", "Worktrees config is invalid", tostring(cfg))
+		if repo == nil or cfg == nil then
+			cx2:toast("error", "Worktrees: no repository", why or "")
 			return
 		end
 		fn(cx2, repo, cfg)

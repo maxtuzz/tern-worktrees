@@ -14,6 +14,8 @@ One branch, one worktree, one Tern session: created, set up, and cleaned up from
 - On remove: remove worktree; leave the git branch unless user opts in later
 - Remote hosts: local only for MVP
 - Setup: declarative phases; Studio is a profile, not hard-coded
+- Autonames: a branch left blank (dialog or Carly) becomes the next free sea-creature name (`pearlfish`, `manatee`, `murex`, …), rotating via a cursor in `tern.kv`
+- Agents: Carly creates and lists worktrees through `tern.carly.export` (`create`, `list`)
 
 ## Manifest
 
@@ -48,6 +50,18 @@ window = "window.luau"
 - After create: `cx.session:settle(pane)` then type setup script into the pane
 - Status segment: `⎇ branch ●n`
 - `available` false on iOS
+
+### Carly exports (window half, desktop)
+
+- `create(branch?, base?, dir?) -> string`: the dialog's create path without the dialog. A blank branch means an autoname, a blank base means the first existing configured base or `HEAD`, and a blank `dir` means the focused pane's directory. It answers through `call:wait` and `call:reply`/`call:fail` once git and the session are done (120 s cap). The reply is one line with the path, branch, session and whether setup started.
+- `list(dir?) -> {{path, branch, main, locked, session}}`.
+- Carly calls `await(plugins.worktrees.create())`. Arguments and results cross as JSON.
+
+### Autonames
+
+- A fixed pool of 40 short lowercase sea-creature words, each a valid branch and its own slug.
+- A name is skipped if it is already a local branch, a worktree folder name, or a session name (Tern's list, plus the plugin's tracked sessions) for the repo.
+- The cursor is persisted in `tern.kv` `autoname_cursor`. When the pool is exhausted, the names repeat with numbers (`pearlfish-2`, …).
 
 ### Host half (`host.luau`)
 
@@ -140,4 +154,3 @@ Vars: `$WT_PATH`, `$WT_MAIN`, `$WT_BRANCH`, `$WT_BASE`, `$ROOT_WORKTREE_PATH`.
 - Automatic Supabase ownership tracking
 - `tern-wt` CLI bridge
 - GitHub PR → worktree
-- Carly export

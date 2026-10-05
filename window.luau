@@ -57,6 +57,12 @@ for _, c in COMMANDS do
 	})
 end
 
+-- Carly exports `create` and `list` (desktop only: `tern.carly` is absent
+-- elsewhere). Their logic loads on first call.
+if tern.carly ~= nil and not IOS then
+	require("./lib/carly").register(shared)
+end
+
 tern.route.link(function(link: LinkRequest, cx: WindowCx): RouteDecision?
 	if string.sub(link.url, 1, 17) ~= "tern-worktrees://" then
 		return nil

@@ -79,7 +79,8 @@ local function submit(state: State, cx: BlockCx)
 		return
 	end
 	local branch = full_branch(state)
-	local problem = util.branch_problem(branch)
+	-- Blank means "pick an autoname"; the window chooses it.
+	local problem = if branch == "" then nil else util.branch_problem(branch)
 	if problem then
 		state.problem = problem
 		return
@@ -150,7 +151,9 @@ local dialog: BlockDef<State> = {
 	view = function(state, _cx)
 		local branch = full_branch(state)
 		local preview: { Node } = {}
-		if branch ~= "" and util.branch_problem(branch) == nil then
+		if branch == "" then
+			preview = { ui.text({ ui.span("Blank branch: Enter creates the next free autoname (a sea creature).", "muted") }) }
+		elseif util.branch_problem(branch) == nil then
 			preview = {
 				ui.kv({
 					{ { ui.span("branch", "muted") }, { ui.span(branch, "strong") } },
@@ -171,7 +174,7 @@ local dialog: BlockDef<State> = {
 				key = "branch",
 				text = state.branch.text,
 				cursor = state.branch.cursor,
-				placeholder = "branch name, e.g. feat/login",
+				placeholder = "branch name, or leave blank for an autoname (manatee, murex…)",
 				prompt = { ui.span(if state.ctx.prefix ~= "" then state.ctx.prefix else "⎇ ", "muted") },
 			}),
 		}

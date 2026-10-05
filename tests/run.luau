@@ -11,6 +11,7 @@ local setup = require("../lib/setup")
 local git = require("../lib/git")
 local field = require("../lib/field")
 local state = require("../lib/state")
+local autoname = require("../lib/autoname")
 
 local passed, failed = 0, 0
 
@@ -85,6 +86,40 @@ test("branch_problem mirrors git's common rules", function()
 	eq(util.branch_problem("a..b") ~= nil, true)
 	eq(util.branch_problem("x.lock") ~= nil, true)
 	eq(util.branch_problem("-x") ~= nil, true)
+end)
+
+-- autoname ----------------------------------------------------------------
+
+test("autoname pool is unique, short and git-safe", function()
+	local seen = {}
+	eq(#autoname.POOL >= 40, true, "pool size")
+	for _, name in autoname.POOL do
+		eq(seen[name], nil, "duplicate " .. name)
+		seen[name] = true
+		eq(util.slug(name), name, "slug of " .. name)
+		eq(util.branch_problem(name), nil, "branch " .. name)
+		eq(#name <= 10, true, "length of " .. name)
+	end
+end)
+
+test("autoname skips taken branches, slugs and sessions and rotates", function()
+	local pool = { "pearlfish", "manatee", "murex" }
+	local name, nxt = autoname.pick({}, 1, "", nil, pool)
+	eq(name, "pearlfish")
+	eq(nxt, 2)
+	name, nxt = autoname.pick({ manatee = true }, 2, "", nil, pool)
+	eq(name, "murex")
+	eq(nxt, 1)
+	local session = function(b)
+		return "studio:" .. b
+	end
+	name = autoname.pick({ ["studio:pearlfish"] = true }, 1, "", session, pool)
+	eq(name, "manatee")
+	name = autoname.pick({ ["max-pearlfish"] = true }, 1, "max/", nil, pool)
+	eq(name, "max/manatee", "slug of a prefixed branch is checked")
+	name = autoname.pick({ pearlfish = true, manatee = true, murex = true }, 3, "", nil, pool)
+	eq(name, "murex-2")
+	eq(autoname.pick({}, 99, "", nil, pool), "murex", "cursor wraps")
 end)
 
 -- url ----------------------------------------------------------------------
@@ -294,6 +329,17 @@ test("dialog refuses invalid branch names", function()
 	eq(s.problem ~= nil, true)
 end)
 
+test("dialog submits a blank branch for an autoname", function()
+	local dialog = stub.registered.blocks.new
+	local cx = stub.block_cx()
+	local s = dialog.init(cx, { tern.json.encode({ token = "t", repo = "r", main = "/r", root = "../{slug}", prefix = "", bases = { "HEAD" } }) }, nil)
+	dialog.view(s, cx)
+	dialog.key(s, stub.key("enter"), cx)
+	local action, params = url.parse(cx.opened[1])
+	eq(action, "create")
+	eq(params.branch, "")
+end)
+
 test("picker hands the choice back", function()
 	local picker = stub.registered.blocks.pick
 	local cx = stub.block_cx()
@@ -329,6 +375,75 @@ test("status segment shows the branch inside a tracked worktree", function()
 	local segs = stub.registered.status({ pane = 1, cwd = "/w/feat-y/app", program = "zsh", title = "", busy = false })
 	eq(segs[1].text, "⎇ feat/y")
 	eq(stub.registered.status({ pane = 1, cwd = "/other", program = "zsh", title = "", busy = false }), nil)
+end)
+
+test("window half exports Carly create and list with valid specs", function()
+	for _, name in { "create", "list" } do
+		local e = stub.registered.exports[name]
+		eq(e ~= nil, true, name)
+		eq(string.match(name, "^[a-z][a-z0-9_]*$") ~= nil, true)
+		eq(#e.spec.sig > 0 and #e.spec.sig <= 1024, true, name .. " sig")
+		eq(#e.spec.doc > 0 and #e.spec.doc <= 1024, true, name .. " doc")
+	end
+end)
+
+test("create with no branch autonames, adds the worktree and reports", function()
+	local create = require("../lib/flows/create")
+	local config = require("../lib/config")
+	stub.kv.autoname_cursor = nil
+	local repo = {
+		top = "/src/studio",
+		common_dir = "/src/studio/.git",
+		main = "/src/studio",
+		name = "studio",
+		branch = "main",
+		worktrees = { { path = "/src/studio", branch = "main", main = true, bare = false, detached = false, locked = false, prunable = false } },
+	}
+	local cfg = config.normalize({ base = { "origin/main" }, phases = { post_create = { { run = "pnpm i" } } } })
+	local cx = stub.window_cx("/src/studio")
+	local result: any = nil
+	stub.processes = {}
+	create.run(cx, repo, cfg, { reload = function() end }, nil, nil, function(ok, message)
+		result = { ok = ok, message = message }
+	end)
+	local argv = stub.answer(cx, 0, "main\npearlfish\norigin/main\n")
+	eq(argv[4], "for-each-ref")
+	argv = stub.answer(cx, 0)
+	eq(table.concat(argv, " "), "git -C /src/studio check-ref-format --branch manatee")
+	stub.answer(cx, 1) -- rev-parse: no such branch yet
+	argv = stub.answer(cx, 0) -- worktree add
+	eq(table.concat(argv, " "), "git -C /src/studio worktree add --no-track -b manatee /src/studio.worktrees/manatee origin/main")
+	eq(result.ok, true)
+	has(result.message, "/src/studio.worktrees/manatee")
+	has(result.message, "session studio:manatee")
+	has(result.message, "setup started")
+	eq(cx.created[1].name, "studio:manatee")
+	eq(cx.created[1].cwd, "/src/studio.worktrees/manatee")
+	eq(state.get("/src/studio.worktrees/manatee").branch, "manatee")
+	eq(stub.kv.autoname_cursor, 3)
+
+	-- The next autoname continues the rotation instead of restarting.
+	create.run(cx, repo, cfg, { reload = function() end }, "", "HEAD", nil)
+	stub.answer(cx, 0, "main\n")
+	argv = stub.answer(cx, 0)
+	eq(argv[#argv], "murex")
+	stub.processes = {}
+	state.drop("/src/studio.worktrees/manatee")
+end)
+
+test("create reports git failures to the caller", function()
+	local create = require("../lib/flows/create")
+	local config = require("../lib/config")
+	local repo = { top = "/r", common_dir = "/r/.git", main = "/r", name = "r", worktrees = {} }
+	local cx = stub.window_cx("/r")
+	local result: any = nil
+	stub.processes = {}
+	create.run(cx, repo, config.normalize(nil), { reload = function() end }, "feat/x", "HEAD", function(ok, message)
+		result = { ok = ok, message = message }
+	end)
+	stub.answer(cx, 128) -- check-ref-format
+	eq(result.ok, false)
+	has(result.message, "Not a valid branch name")
 end)
 
 print(string.format("%d passed, %d failed", passed, failed))

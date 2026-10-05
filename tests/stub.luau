@@ -19,6 +19,7 @@ stub.registered = {
 	blocks = {} :: { [string]: any },
 	events = {} :: { [string]: { any } },
 	links = {} :: { any },
+	exports = {} :: { [string]: any },
 	status = nil :: any,
 }
 stub.processes = {} :: { any }
@@ -160,6 +161,11 @@ local tern: any = {
 		window_title = function(_fn) end,
 	},
 	css = function(_n, _s) end,
+	carly = {
+		export = function(name, spec, fn)
+			stub.registered.exports[name] = { spec = spec, fn = fn }
+		end,
+	},
 }
 
 install(tern)
@@ -184,6 +190,72 @@ function stub.block_cx(): any
 	function cx:toast(_l, _t, _s) end
 	function cx:copy(_t) end
 	return cx
+end
+
+-- A window cx with one session and one shell pane; records toasts, typed
+-- text and created sessions.
+function stub.window_cx(cwd: string?): any
+	local cx: any = { toasts = {}, typed = {}, created = {} }
+	local sessions = { { id = 1, name = "Default", host = 0, current = true, locked = false, tabs = 1 } }
+	cx.sessions = {
+		list = function(_self)
+			return sessions
+		end,
+		current = function(_self)
+			return sessions[1]
+		end,
+		create = function(_self, opts)
+			local s = { id = #sessions + 1, name = opts.name, host = 0, current = true, locked = false, tabs = 1, cwd = opts.cwd }
+			table.insert(sessions, s)
+			table.insert(cx.created, s)
+			return s
+		end,
+		switch = function(_self, _id) end,
+		close = function(_self, _id) end,
+	}
+	cx.session = {
+		focused = function(_self)
+			return 10
+		end,
+		pane = function(_self, id)
+			return { pane = id, cwd = cwd or "/r", title = "", kind = "terminal", busy = false, at_prompt = true }
+		end,
+		panes = function(_self)
+			return {}
+		end,
+		sessions = function(_self)
+			return {}
+		end,
+		layout = function(_self, _tab)
+			return nil
+		end,
+	}
+	cx.actions = {
+		describe = function(_self, id)
+			error("unknown action " .. id)
+		end,
+	}
+	function cx:toast(level, text, sub)
+		table.insert(self.toasts, { level = level, text = text, sub = sub })
+	end
+	function cx:run(pane, text)
+		table.insert(self.typed, { pane = pane, text = text })
+	end
+	function cx:action(_name) end
+	function cx:new_block(_kind, _args, _how)
+		return 99
+	end
+	return cx
+end
+
+-- Answers the oldest pending process with `stdout` and `status`; returns its argv.
+function stub.answer(cx: any, status: number, stdout: string?): { string }
+	local p = table.remove(stub.processes, 1)
+	if p == nil then
+		error("no pending process", 2)
+	end
+	p.cb({ status = status, stdout = stdout or "", stderr = "", timed_out = false }, cx)
+	return p.argv
 end
 
 function stub.key(name: string, text: string?): any
