@@ -1,0 +1,19 @@
+schema = 1
+id = "worktrees"
+name = "Worktree Sessions"
+version = "0.1.0"
+description = "One git worktree ↔ one Tern session, with declarative setup"
+icon = "branch"
+host = "host.luau"
+window = "window.luau"
+styles = ["worktrees.css"]
+
+[[blocks]]
+id = "new"
+title = "New worktree"
+palette = false
+
+[[blocks]]
+id = "pick"
+title = "Worktrees"
+palette = false

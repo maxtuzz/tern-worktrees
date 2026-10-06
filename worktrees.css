@@ -1,0 +1,9 @@
+/* The worktree branch in the status line reads as a label. */
+#statusline .sl-plugin[data-plugin="worktrees"] {
+	font-weight: 600;
+}
+
+/* Dialog blocks: a little breathing room around the form. */
+[data-surface^="plugin.worktrees."].sf-main {
+	padding: 6px 4px;
+}
