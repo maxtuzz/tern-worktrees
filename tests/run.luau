@@ -12,6 +12,9 @@ local git = require("../lib/git")
 local field = require("../lib/field")
 local state = require("../lib/state")
 local autoname = require("../lib/autoname")
+local repos = require("../lib/repos")
+local quick = require("../lib/quick")
+local known = require("../lib/known")
 
 local passed, failed = 0, 0
 
@@ -120,6 +123,197 @@ test("autoname skips taken branches, slugs and sessions and rotates", function()
 	name = autoname.pick({ pearlfish = true, manatee = true, murex = true }, 3, "", nil, pool)
 	eq(name, "murex-2")
 	eq(autoname.pick({}, 99, "", nil, pool), "murex", "cursor wraps")
+end)
+
+-- repos (the known-repos registry) -----------------------------------------
+
+test("repos derives aliases from paths and checks them", function()
+	eq(repos.alias_from_path("/Users/me/dev/studio-gsm"), "studio-gsm")
+	eq(repos.alias_from_path("/src/Studio GSM/"), "studio-gsm")
+	eq(repos.alias_problem("studio"), nil)
+	eq(repos.alias_problem("tern-worktrees"), nil)
+	eq(repos.alias_problem("") ~= nil, true)
+	eq(repos.alias_problem("has space") ~= nil, true)
+	eq(repos.alias_problem("-x") ~= nil, true)
+	eq(repos.alias_problem("off") ~= nil, true, "quick-entry keyword")
+	eq(repos.alias_problem("FROM") ~= nil, true, "keywords are case-insensitive")
+end)
+
+test("repos add defaults the alias, keeps paths unique and refuses clashes", function()
+	local reg = repos.add({}, { path = "/src/studio-gsm", now = 10 })
+	eq(reg.studio_gsm, nil)
+	eq(reg["studio-gsm"].alias, "studio-gsm")
+	eq(reg["studio-gsm"].used_at, 10)
+	eq(repos.get(reg, "STUDIO-GSM") ~= nil, true, "lookup is case-insensitive")
+
+	reg = repos.add(reg, { path = "/src/studio-gsm", alias = "studio", base = "dev", now = 11 })
+	eq(next(reg, next(reg)), nil, "re-aliasing replaces, never duplicates")
+	eq(reg.studio.path, "/src/studio-gsm")
+	eq(reg.studio.base, "dev")
+
+	reg = repos.add(reg, { path = "/src/tern", now = 12 })
+	raises(function()
+		repos.add(reg, { path = "/src/other", alias = "studio" })
+	end, "already points at /src/studio-gsm")
+	raises(function()
+		repos.add(reg, { path = "relative/path" })
+	end, "must be absolute")
+	raises(function()
+		repos.add(reg, { path = "/src/x", alias = "off" })
+	end, "quick-entry keyword")
+end)
+
+test("repos remove, set_base and touch leave the rest alone", function()
+	local reg = repos.add(repos.add({}, { path = "/src/a", now = 1 }), { path = "/src/b", now = 2 })
+	eq(#repos.mru(reg), 2)
+	eq(repos.mru(reg)[1].alias, "b", "most recently used first")
+
+	reg = repos.set_base(reg, "A", "origin/dev")
+	eq(reg.a.base, "origin/dev")
+	eq(repos.set_base(reg, "a", nil).a.base, nil, "a blank base clears it")
+
+	reg = repos.touch(reg, "/src/a", 9)
+	eq(repos.mru(reg)[1].alias, "a")
+	eq(repos.touch(reg, "/nowhere", 99), reg, "an unknown path changes nothing")
+
+	reg = repos.remove(reg, "b")
+	eq(reg.b, nil)
+	eq(reg.a ~= nil, true)
+	raises(function()
+		repos.remove(reg, "b")
+	end, "No known repository")
+	raises(function()
+		repos.set_base(reg, "b", "x")
+	end, "No known repository")
+end)
+
+test("repos register auto-names, keeps aliases unique and touches what it knows", function()
+	local reg = repos.register({}, "/src/studio", 5)
+	eq(reg.studio.path, "/src/studio")
+	eq(reg.studio.used_at, 5)
+	reg = repos.register(reg, "/elsewhere/studio", 6)
+	eq(reg["studio-2"].path, "/elsewhere/studio")
+	reg = repos.register(reg, "/src/studio", 7)
+	eq(reg.studio.used_at, 7, "a known path is touched, not re-added")
+	eq(reg["studio-2"].used_at, 6)
+	eq(repos.register(reg, "/", 8)["."], nil)
+end)
+
+test("repos normalize skips malformed entries", function()
+	local reg = repos.normalize({
+		studio = { path = "/src/studio/", base = "dev", used_at = 3 },
+		bad = { base = "dev" },
+		["has space"] = { path = "/src/x" },
+		junk = "nope",
+	})
+	eq(reg.studio.path, "/src/studio", "trailing slashes go")
+	eq(reg.studio.used_at, 3)
+	eq(reg.bad, nil)
+	eq(reg["has space"], nil)
+	eq(reg.junk, nil)
+	eq(next(repos.normalize("nope")), nil)
+end)
+
+test("repos.json declarations win over the store but keep its MRU time", function()
+	local declared = repos.declared({
+		repos = {
+			studio = { path = "~/dev/studio-gsm", base = "dev" },
+			tern = { path = "/src/tern" },
+		},
+	}, "/Users/me")
+	eq(declared.studio.path, "/Users/me/dev/studio-gsm")
+	eq(declared.studio.declared, true)
+	eq(declared.studio.fixed_base, true)
+	eq(declared.tern.fixed_base, nil)
+	eq(next(repos.declared({ studio = "~/dev/studio-gsm" }, "/Users/me")) ~= nil, true, "a bare path works")
+	eq(repos.declared({ { alias = "studio", path = "/src/s" } }, nil).studio.path, "/src/s", "an array works")
+
+	local stored = repos.normalize({
+		studio = { path = "/Users/me/dev/studio-gsm", base = "main", used_at = 42 },
+		old = { path = "/src/tern", used_at = 7 },
+	})
+	local merged = repos.merge(stored, declared)
+	eq(merged.studio.base, "dev", "the file's base wins")
+	eq(merged.studio.used_at, 42, "the store's last-used time survives")
+	eq(merged.old, nil, "a stale alias for a declared path goes")
+	eq(merged.tern.path, "/src/tern")
+	raises(function()
+		repos.remove(merged, "studio")
+	end, "declared in repos.json")
+	raises(function()
+		repos.set_base(merged, "studio", "x")
+	end, "set in repos.json")
+	eq(repos.set_base(merged, "tern", "dev").tern.base, "dev", "an unpinned base is still settable")
+	eq(repos.merge(stored, {}), stored)
+end)
+
+-- quick entry --------------------------------------------------------------
+
+test("quick entry parses [repo] [branch] [off <base>]", function()
+	local aliases = { studio = true, tern = true }
+	local is_alias = function(t: string): boolean
+		return aliases[string.lower(t)] == true
+	end
+	local function p(line: string): any
+		return quick.parse(line, is_alias)
+	end
+	local blank = p("")
+	eq(blank.repo, nil)
+	eq(blank.branch, nil)
+	eq(blank.base, nil)
+	eq(blank.problem, nil)
+
+	eq(p("off dev").base, "dev")
+	eq(p("off dev").repo, nil)
+	eq(p("  from   origin/dev  ").base, "origin/dev", "extra spaces and `from`")
+
+	local one = p("studio off dev")
+	eq(one.repo, "studio")
+	eq(one.branch, nil)
+	eq(one.base, "dev")
+
+	local full = p("studio feat/foo off dev")
+	eq(full.repo, "studio")
+	eq(full.branch, "feat/foo")
+	eq(full.base, "dev")
+
+	eq(p("feat/foo").branch, "feat/foo")
+	eq(p("feat/foo").repo, nil)
+	eq(p("STUDIO").repo, "STUDIO", "aliases match case-insensitively")
+	eq(p("studio").branch, nil)
+	eq(p("studio studio").branch, "studio", "a branch named like an alias goes second")
+
+	eq(p("@dev").base, "dev")
+	eq(p("--base=dev").base, "dev")
+	eq(p("--base dev").base, "dev")
+	eq(p("tern feat/x @origin/main").base, "origin/main")
+	eq(quick.parse("studio off dev").repo, nil, "without a predicate nothing is a repo")
+	eq(quick.parse("studio off dev").branch, "studio")
+end)
+
+test("quick entry reports what it can't place", function()
+	local p = quick.parse
+	has(p("off").problem :: string, "Name a base after off")
+	has(p("@").problem :: string, "Name a base after @")
+	has(p("a off dev off main").problem :: string, "Two bases")
+	has(p("a b c").problem :: string, "Nothing fits")
+end)
+
+test("add-repo entry parses <path> [as <alias>] [off <base>]", function()
+	local bare = quick.parse_repo("~/dev/studio-gsm")
+	eq(bare.path, "~/dev/studio-gsm")
+	eq(bare.alias, nil)
+	eq(bare.base, nil)
+
+	local full = quick.parse_repo("  /src/studio  as studio off dev ")
+	eq(full.path, "/src/studio")
+	eq(full.alias, "studio")
+	eq(full.base, "dev")
+	eq(quick.parse_repo("/src/s --alias s @main").alias, "s")
+	eq(quick.parse_repo("/src/s --alias s @main").base, "main")
+	eq(quick.parse_repo("").path, nil)
+	has(quick.parse_repo("/src/s as").problem :: string, "Name an alias after as")
+	has(quick.parse_repo("/a /b").problem :: string, "Nothing fits")
 end)
 
 -- url ----------------------------------------------------------------------
@@ -340,6 +534,35 @@ test("dialog submits a blank branch for an autoname", function()
 	eq(params.branch, "")
 end)
 
+test("line block hands the typed line back under its own action", function()
+	local line = stub.registered.blocks.line
+	local cx = stub.block_cx()
+	local s = line.init(cx, { tern.json.encode({
+		token = "ln",
+		action = "quick",
+		title = "Quick worktree",
+		grammar = "quick",
+		aliases = { "studio" },
+		hints = { { text = "[repo] [branch] [off <base>]" } },
+	}) }, nil)
+	line.view(s, cx)
+	line.key(s, stub.key("paste", "studio off dev"), cx)
+	line.view(s, cx) -- the preview parses while you type
+	line.key(s, stub.key("enter"), cx)
+	local action, params = url.parse(cx.opened[1])
+	eq(action, "quick")
+	eq(params.token, "ln")
+	eq(params.line, "studio off dev")
+
+	-- Escape cancels, and a bad grammar line previews its problem.
+	local cx2 = stub.block_cx()
+	local s2 = line.init(cx2, { tern.json.encode({ token = "ln2", action = "addrepo", title = "Add repo", grammar = "repo" }) }, nil)
+	line.key(s2, stub.key("paste", "/a /b"), cx2)
+	line.view(s2, cx2)
+	line.key(s2, stub.key("escape"), cx2)
+	eq((url.parse(cx2.opened[1])), "cancel")
+end)
+
 test("picker hands the choice back", function()
 	local picker = stub.registered.blocks.pick
 	local cx = stub.block_cx()
@@ -354,7 +577,7 @@ end)
 
 -- window half --------------------------------------------------------------
 
-test("window half registers six commands, a link route and a status segment", function()
+test("window half registers its commands, a link route and a status segment", function()
 	tern.context = "window"
 	require("../window")
 	local ids = {}
@@ -362,7 +585,7 @@ test("window half registers six commands, a link route and a status segment", fu
 		table.insert(ids, c.id)
 	end
 	table.sort(ids)
-	eq(table.concat(ids, ","), "adopt,new,open,prune,remove,setup")
+	eq(table.concat(ids, ","), "addrepo,adopt,new,open,prune,quick,remove,rmrepo,setbase,setup")
 	eq(#stub.registered.links, 1)
 	eq(stub.registered.links[1]({ url = "https://example.com", mods = {} }, {}), nil)
 end)
@@ -377,11 +600,17 @@ test("status segment shows the branch inside a tracked worktree", function()
 	eq(stub.registered.status({ pane = 1, cwd = "/other", program = "zsh", title = "", busy = false }), nil)
 end)
 
-test("window half exports Carly create and list with valid specs", function()
-	for _, name in { "create", "list" } do
+test("window half exports Carly create, list, repos and add_repo with valid specs", function()
+	local names = {}
+	for name in stub.registered.exports do
+		table.insert(names, name)
+	end
+	table.sort(names)
+	eq(table.concat(names, ","), "add_repo,create,list,repos")
+	eq(#names <= 16, true, "at most 16 exports")
+	for _, name in names do
 		local e = stub.registered.exports[name]
-		eq(e ~= nil, true, name)
-		eq(string.match(name, "^[a-z][a-z0-9_]*$") ~= nil, true)
+		eq(string.match(name, "^[a-z][a-z0-9_]?[a-z0-9_]*$") ~= nil and #name <= 24, true, name)
 		eq(#e.spec.sig > 0 and #e.spec.sig <= 1024, true, name .. " sig")
 		eq(#e.spec.doc > 0 and #e.spec.doc <= 1024, true, name .. " doc")
 	end
@@ -391,6 +620,7 @@ test("create with no branch autonames, adds the worktree and reports", function(
 	local create = require("../lib/flows/create")
 	local config = require("../lib/config")
 	stub.kv.autoname_cursor = nil
+	stub.kv.repos = nil
 	local repo = {
 		top = "/src/studio",
 		common_dir = "/src/studio/.git",
@@ -411,6 +641,8 @@ test("create with no branch autonames, adds the worktree and reports", function(
 	argv = stub.answer(cx, 0)
 	eq(table.concat(argv, " "), "git -C /src/studio check-ref-format --branch manatee")
 	stub.answer(cx, 1) -- rev-parse: no such branch yet
+	argv = stub.answer(cx, 0) -- the base lives on origin, so freshen just it
+	eq(table.concat(argv, " "), "git -C /src/studio fetch --quiet origin main")
 	argv = stub.answer(cx, 0) -- worktree add
 	eq(table.concat(argv, " "), "git -C /src/studio worktree add --no-track -b manatee /src/studio.worktrees/manatee origin/main")
 	eq(result.ok, true)
@@ -421,6 +653,8 @@ test("create with no branch autonames, adds the worktree and reports", function(
 	eq(cx.created[1].cwd, "/src/studio.worktrees/manatee")
 	eq(state.get("/src/studio.worktrees/manatee").branch, "manatee")
 	eq(stub.kv.autoname_cursor, 3)
+	-- Creating inside a repository registers it, so it works from anywhere.
+	eq((known.get("studio") :: any).path, "/src/studio")
 
 	-- The next autoname continues the rotation instead of restarting.
 	create.run(cx, repo, cfg, { reload = function() end }, "", "HEAD", nil)
@@ -441,9 +675,258 @@ test("create reports git failures to the caller", function()
 	create.run(cx, repo, config.normalize(nil), { reload = function() end }, "feat/x", "HEAD", function(ok, message)
 		result = { ok = ok, message = message }
 	end)
+	stub.answer(cx, 0, "main\n") -- for-each-ref
 	stub.answer(cx, 128) -- check-ref-format
 	eq(result.ok, false)
 	has(result.message, "Not a valid branch name")
+end)
+
+-- base resolution ----------------------------------------------------------
+
+test("a typed base falls back to its origin ref, and defaults are ordered", function()
+	local create = require("../lib/flows/create")
+	local config = require("../lib/config")
+	local refs = { main = true, ["origin/main"] = true, ["origin/dev"] = true }
+	eq(create.resolve_base("main", refs), "main")
+	eq(create.resolve_base("dev", refs), "origin/dev", "only the remote has it")
+	eq(create.resolve_base("origin/dev", refs), "origin/dev")
+	eq(create.resolve_base("nope", refs), "nope", "git reports the rest")
+	eq(create.resolve_base("", refs), "")
+
+	local cfg = config.normalize({ base = { "origin/main", "main" } })
+	eq(create.pick_base("dev", refs, cfg, nil), "origin/dev")
+	eq(create.pick_base("", refs, cfg, nil), "origin/main", "first configured base that exists")
+	eq(create.pick_base("", refs, cfg, "dev"), "origin/dev", "the repo's default base comes first")
+	eq(create.pick_base("", { x = true }, cfg, nil), "HEAD")
+	eq(create.pick_base("", refs, cfg, "gone"), "origin/main", "a default base that no longer exists is skipped")
+	eq(table.concat(create.bases(cfg, refs, "feat/x", "dev"), ","), "origin/dev,origin/main,main,feat/x,HEAD")
+	eq(table.concat(create.bases(cfg, refs, nil, "gone"), ","), "origin/main,main,HEAD")
+
+	eq(create.fetch_spec("origin/dev"), "dev")
+	eq(create.fetch_spec("origin/feat/x"), "feat/x")
+	eq(create.fetch_spec("main"), nil, "local refs aren't fetched")
+	eq(create.fetch_spec("upstream/dev"), nil, "only origin")
+	eq(create.fetch_spec("origin/HEAD"), nil)
+end)
+
+-- the known-repos store ----------------------------------------------------
+
+test("the known-repos store round-trips through kv and repos.json", function()
+	stub.kv.repos = nil
+	stub.files["/data/repos.json"] = nil
+	eq(#known.mru(), 0)
+
+	local entry = known.add({ path = "/src/studio-gsm", alias = "studio", base = "dev", now = 100 })
+	eq(entry.alias, "studio")
+	eq(stub.kv.repos.studio.path, "/src/studio-gsm", "written to kv under \"repos\"")
+	known.add({ path = "/src/tern", now = 101 })
+	eq(table.concat({ known.mru()[1].alias, known.mru()[2].alias }, ","), "tern,studio")
+
+	known.register("/src/studio-gsm")
+	eq(known.mru()[1].alias, "studio", "register touches a known repo")
+	eq((known.by_path("/src/studio-gsm") :: any).base, "dev")
+
+	known.set_base("tern", "origin/main")
+	eq((known.get("TERN") :: any).base, "origin/main")
+	known.remove("tern")
+	eq(known.get("tern"), nil)
+
+	-- repos.json declares one, and is authoritative for it.
+	stub.files["/data/repos.json"] = tern.json.encode({
+		repos = { carly = { path = "~/dev/carly", base = "dev" } },
+	})
+	eq((known.get("carly") :: any).path, "/Users/me/dev/carly")
+	eq((known.get("carly") :: any).declared, true)
+	raises(function()
+		known.remove("carly")
+	end, "declared in repos.json")
+
+	-- A malformed file warns and is ignored rather than breaking the palette.
+	stub.files["/data/repos.json"] = "{ not json"
+	eq(known.get("carly"), nil)
+	eq((known.get("studio") :: any).alias, "studio")
+	stub.files["/data/repos.json"] = nil
+	stub.kv.repos = nil
+end)
+
+-- create from outside any repository ---------------------------------------
+
+test("quick entry creates in a named repo from a directory that isn't one", function()
+	local create = require("../lib/flows/create")
+	stub.processes = {}
+	stub.kv.repos = { studio = { alias = "studio", path = "/src/studio", base = "dev", used_at = 1 } }
+	-- A shell in no repository at all: the alias on the line decides.
+	local cx = stub.window_cx("/tmp/nowhere")
+	create.from_line(cx, { reload = function() end }, "  studio feat/foo off dev  ")
+
+	-- app.target → the registry entry's path → git.repo
+	local argv = stub.answer(cx, 0, "/src/studio\n/src/studio/.git\n")
+	eq(argv[4], "rev-parse")
+	eq(argv[3], "/src/studio", "resolved from the registry, not the cwd")
+	argv = stub.answer(cx, 0, "worktree /src/studio\nHEAD abc123\nbranch refs/heads/main\n")
+	eq(argv[5], "list")
+	-- create.run: refs, then `dev` resolves to origin/dev
+	argv = stub.answer(cx, 0, "main\norigin/main\norigin/dev\n")
+	eq(argv[4], "for-each-ref")
+	argv = stub.answer(cx, 0) -- check-ref-format
+	eq(argv[#argv], "feat/foo")
+	stub.answer(cx, 1) -- rev-parse: the branch is new
+	argv = stub.answer(cx, 0) -- fetch just the base
+	eq(table.concat(argv, " "), "git -C /src/studio fetch --quiet origin dev")
+	argv = stub.answer(cx, 0) -- worktree add
+	eq(table.concat(argv, " "), "git -C /src/studio worktree add --no-track -b feat/foo /src/studio.worktrees/feat-foo origin/dev")
+	eq(cx.created[1].name, "studio:feat/foo")
+	eq(cx.created[1].cwd, "/src/studio.worktrees/feat-foo")
+	eq((state.get("/src/studio.worktrees/feat-foo") :: any).base, "origin/dev")
+	eq(known.mru()[1].used_at > 1, true, "the repo moves to the front of the picker")
+	state.drop("/src/studio.worktrees/feat-foo")
+	stub.processes = {}
+end)
+
+test("a base that can't be fetched still creates, and says so", function()
+	local create = require("../lib/flows/create")
+	local config = require("../lib/config")
+	stub.processes = {}
+	stub.kv.repos = nil
+	local repo = {
+		top = "/src/r",
+		common_dir = "/src/r/.git",
+		main = "/src/r",
+		name = "r",
+		branch = "main",
+		worktrees = { { path = "/src/r", branch = "main", main = true, bare = false, detached = false, locked = false, prunable = false } },
+	}
+	local cx = stub.window_cx("/src/r")
+	local result: any = nil
+	create.run(cx, repo, config.normalize(nil), { reload = function() end }, "feat/x", "origin/main", function(ok, message)
+		result = { ok = ok, message = message }
+	end)
+	stub.answer(cx, 0, "main\norigin/main\n") -- for-each-ref
+	stub.answer(cx, 0) -- check-ref-format
+	stub.answer(cx, 1) -- rev-parse: the branch is new
+	stub.answer(cx, 128, "") -- fetch fails: offline
+	local argv = stub.answer(cx, 0) -- worktree add runs anyway
+	eq(argv[#argv], "origin/main")
+	eq(result.ok, true)
+	has(result.message, "used the local ref")
+	state.drop("/src/r.worktrees/feat-x")
+	stub.processes = {}
+	stub.kv.repos = nil
+end)
+
+test("quick entry reports a line it can't parse instead of guessing", function()
+	local create = require("../lib/flows/create")
+	stub.processes = {}
+	local cx = stub.window_cx("/tmp/nowhere")
+	create.from_line(cx, { reload = function() end }, "a b c")
+	eq(#stub.processes, 0, "nothing ran")
+	has(cx.toasts[#cx.toasts].sub, "Nothing fits")
+end)
+
+-- the registry commands, dialog and all ------------------------------------
+
+-- Answers the `line` or `pick` block the window just opened, the way the
+-- host half's block would: through a `tern-worktrees://` link.
+local function answer_block(cx: any, action: string, params: { [string]: string })
+	local app = require("../lib/app")
+	local ctx = stub.last_block(cx)
+	local sent: { [string]: string } = { token = ctx.token }
+	for k, v in params do
+		sent[k] = v
+	end
+	app.link({ url = url.build(action, sent), mods = {} }, cx)
+end
+
+test("Add repo, Set default base and Remove repo drive the registry", function()
+	local app = require("../lib/app")
+	local shared = { reload = function() end }
+	stub.processes = {}
+	stub.kv.repos = nil
+	local cx = stub.window_cx("/src/studio")
+
+	-- "Add repo…" prefills the focused pane's repository.
+	app.run("addrepo", cx, shared)
+	stub.answer(cx, 0, "/src/studio\n/src/studio/.git\n") -- rev-parse
+	stub.answer(cx, 0, "worktree /src/studio\nHEAD abc\nbranch refs/heads/main\n")
+	local ctx, kind = stub.last_block(cx)
+	eq(kind, "worktrees.line")
+	eq(ctx.value, "/src/studio")
+	eq(ctx.grammar, "repo")
+
+	answer_block(cx, "addrepo", { line = "/src/studio as studio off dev" })
+	stub.answer(cx, 0, "/src/studio\n/src/studio/.git\n")
+	stub.answer(cx, 0, "worktree /src/studio\nHEAD abc\nbranch refs/heads/main\n")
+	eq((known.get("studio") :: any).base, "dev")
+	eq(cx.toasts[#cx.toasts].text, "Added studio")
+
+	-- "Set default base…" skips the picker when only one repo is known.
+	app.run("setbase", cx, shared)
+	eq(select(2, stub.last_block(cx)), "worktrees.line")
+	eq((stub.last_block(cx) :: any).value, "dev")
+	answer_block(cx, "setbase", { line = " origin/main " })
+	eq((known.get("studio") :: any).base, "origin/main")
+	-- Each dialog's token is one-shot, so a second answer needs a second ask.
+	app.run("setbase", cx, shared)
+	answer_block(cx, "setbase", { line = "" })
+	eq((known.get("studio") :: any).base, nil, "a blank line clears it")
+
+	-- "Remove repo…" drops the entry; the worktrees stay.
+	known.add({ path = "/src/tern", now = 5 })
+	app.run("rmrepo", cx, shared)
+	eq(select(2, stub.last_block(cx)), "worktrees.pick")
+	eq(#(stub.last_block(cx) :: any).items, 2)
+	answer_block(cx, "pick", { choice = "1" })
+	eq(#known.mru(), 1)
+	eq(known.mru()[1].alias, "tern", "the newer entry was listed first and removed")
+
+	-- A path that isn't a repository is refused, and nothing is stored.
+	app.run("addrepo", cx, shared)
+	stub.answer(cx, 128, "") -- rev-parse for the prefill
+	answer_block(cx, "addrepo", { line = "/tmp/nope" })
+	stub.answer(cx, 128, "fatal: not a git repository")
+	eq(cx.toasts[#cx.toasts].text, "Not a git repository")
+	eq(known.get("nope"), nil)
+	eq(#stub.processes, 0, "every git call was answered")
+	stub.kv.repos = nil
+end)
+
+test("New worktree from outside a repo picks a repository, then opens the dialog", function()
+	local app = require("../lib/app")
+	local shared = { reload = function() end }
+	stub.processes = {}
+	stub.kv.repos = {
+		studio = { alias = "studio", path = "/src/studio", base = "dev", used_at = 2 },
+		tern = { alias = "tern", path = "/src/tern", used_at = 9 },
+	}
+	local cx = stub.window_cx("/tmp/nowhere")
+	app.run("new", cx, shared)
+	stub.answer(cx, 128, "fatal: not a git repository") -- the cwd isn't one
+
+	local pick, kind = stub.last_block(cx)
+	eq(kind, "worktrees.pick")
+	eq(table.concat({ pick.items[1].label, pick.items[2].label }, ","), "tern,studio", "most recent first")
+
+	answer_block(cx, "pick", { choice = "2" }) -- studio
+	stub.answer(cx, 0, "/src/studio\n/src/studio/.git\n")
+	stub.answer(cx, 0, "worktree /src/studio\nHEAD abc\nbranch refs/heads/main\n")
+	stub.answer(cx, 0, "main\norigin/main\norigin/dev\n") -- for-each-ref
+	local dialog = stub.last_block(cx)
+	eq(select(2, stub.last_block(cx)), "worktrees.new")
+	eq(dialog.repo, "studio")
+	eq(dialog.bases[1], "origin/dev", "the registered default base leads")
+	eq(#stub.processes, 0)
+	stub.kv.repos = nil
+end)
+
+test("with nothing known and nowhere to look, New worktree says what to do", function()
+	local app = require("../lib/app")
+	stub.processes = {}
+	stub.kv.repos = nil
+	local cx = stub.window_cx("/tmp/nowhere")
+	app.run("new", cx, { reload = function() end })
+	stub.answer(cx, 128, "") -- rev-parse: not a git repository
+	eq(#stub.processes, 0)
+	eq(cx.toasts[#cx.toasts].text, "No known repositories")
 end)
 
 print(string.format("%d passed, %d failed", passed, failed))

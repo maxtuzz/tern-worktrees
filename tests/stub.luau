@@ -195,7 +195,7 @@ end
 -- A window cx with one session and one shell pane; records toasts, typed
 -- text and created sessions.
 function stub.window_cx(cwd: string?): any
-	local cx: any = { toasts = {}, typed = {}, created = {} }
+	local cx: any = { toasts = {}, typed = {}, created = {}, blocks = {} }
 	local sessions = { { id = 1, name = "Default", host = 0, current = true, locked = false, tabs = 1 } }
 	cx.sessions = {
 		list = function(_self)
@@ -242,10 +242,21 @@ function stub.window_cx(cwd: string?): any
 		table.insert(self.typed, { pane = pane, text = text })
 	end
 	function cx:action(_name) end
-	function cx:new_block(_kind, _args, _how)
+	function cx:new_block(kind, args, how)
+		table.insert(self.blocks, { kind = kind, args = args, how = how })
 		return 99
 	end
 	return cx
+end
+
+-- The launch argument of the last block the window opened, decoded. Tests use
+-- it to read the one-shot token a dialog would answer with.
+function stub.last_block(cx: any): any
+	local block = cx.blocks[#cx.blocks]
+	if block == nil then
+		error("no block was opened", 2)
+	end
+	return tern.json.decode(block.args[1]), block.kind
 end
 
 -- Answers the oldest pending process with `stdout` and `status`; returns its argv.
