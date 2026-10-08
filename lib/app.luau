@@ -18,6 +18,16 @@ export type Shared = {
 	reload: () -> (),
 }
 
+-- The actions our own dialog blocks answer with, so a link that finds no
+-- live token can be told apart from any other `tern-worktrees://` URL.
+local DIALOG_ACTIONS: { [string]: boolean } = {
+	create = true,
+	pick = true,
+	quick = true,
+	addrepo = true,
+	setbase = true,
+}
+
 type Handler = (cx: WindowCx, action: string, params: { [string]: string }) -> ()
 local pending: { [string]: { at: number, on: Handler } } = {}
 local seq = 0
@@ -88,6 +98,87 @@ function app.with_repo(cx: WindowCx, fn: (WindowCx, git.Repo, config.Config) -> 
 	end)
 end
 
+-- Calls `fn(cx, repo, cfg)` for the repository whose main worktree is
+-- `path`, registering it as known on the way.
+function app.open_repo(cx: WindowCx, path: string, fn: (WindowCx, git.Repo, config.Config) -> ())
+	app.repo_at(path, function(repo, cfg, why, cx2)
+		if cx2 == nil then
+			return
+		end
+		if repo == nil or cfg == nil then
+			cx2:toast("error", "Worktrees: no repository", why or "")
+			return
+		end
+		pcall(require("./known").register, repo.main)
+		fn(cx2, repo, cfg)
+	end)
+end
+
+-- Asks which known repository to use (most recently used first), then calls
+-- `fn(cx, repo, cfg)`. `why` explains why there was nothing closer to hand.
+function app.pick_repo(cx: WindowCx, why: string?, fn: (WindowCx, git.Repo, config.Config) -> ())
+	local list = require("./known").mru()
+	if #list == 0 then
+		cx:toast("error", "No known repositories", why or "Run \"Add repo…\" to register one")
+		return
+	end
+	if #list == 1 then
+		app.open_repo(cx, list[1].path, fn)
+		return
+	end
+	local items = {}
+	for i, entry in list do
+		local bits = { app.tilde(entry.path) }
+		if entry.base then
+			table.insert(bits, "off " .. (entry.base :: string))
+		end
+		table.insert(items, { label = entry.alias, detail = table.concat(bits, " · "), choice = tostring(i) })
+	end
+	app.pick(cx, {
+		title = "Which repository?",
+		subtitle = "most recently used first",
+		notes = if why then { { text = why } } else nil,
+		items = items,
+	}, function(cx2, choice)
+		local entry = list[tonumber(choice) or 0]
+		if entry then
+			app.open_repo(cx2, entry.path, fn)
+		end
+	end)
+end
+
+-- The repository a command should act on, from any session or directory:
+-- `alias` when one was typed, else the focused pane's repository, else a pick
+-- from the known repos. Calls `fn(cx, repo, cfg)`.
+function app.target(cx: WindowCx, alias: string?, fn: (WindowCx, git.Repo, config.Config) -> ())
+	local wanted = util.trim(alias or "")
+	if wanted ~= "" then
+		local entry = require("./known").get(wanted)
+		if entry == nil then
+			cx:toast("error", "No known repository " .. wanted, "Run \"Add repo…\" first")
+			return
+		end
+		app.open_repo(cx, entry.path, fn)
+		return
+	end
+	local cwd = app.focused_cwd(cx)
+	if cwd == nil then
+		app.pick_repo(cx, nil, fn)
+		return
+	end
+	app.repo_at(cwd, function(repo, cfg, why, cx2)
+		if cx2 == nil then
+			return
+		end
+		if repo ~= nil and cfg ~= nil then
+			pcall(require("./known").register, repo.main)
+			fn(cx2, repo, cfg)
+			return
+		end
+		app.pick_repo(cx2, why, fn)
+	end)
+end
+
 -- Opens the `pick` block listing `items`; `on_choice(cx, choice)` runs for
 -- the chosen item.
 function app.pick(
@@ -113,6 +204,38 @@ function app.pick(
 	end
 end
 
+-- Opens the one-line `line` dialog; `on_line(cx, line)` runs on submit.
+function app.line(
+	cx: WindowCx,
+	spec: {
+		action: string,
+		title: string,
+		subtitle: string?,
+		value: string?,
+		placeholder: string?,
+		submit: string?,
+		hints: { any }?,
+		grammar: string?,
+		aliases: { string }?,
+	},
+	on_line: (WindowCx, string) -> ()
+)
+	local token = app.token(function(cx2, _action, params)
+		if params.line ~= nil then
+			on_line(cx2, params.line)
+		end
+	end)
+	local arg = table.clone(spec) :: { [string]: any }
+	arg.token = token
+	arg.home = HOME
+	arg.hints = tern.json.array(spec.hints or {})
+	arg.aliases = tern.json.array(spec.aliases or {})
+	if cx:new_block("worktrees.line", { tern.json.encode(arg) }, "below") == nil then
+		pending[token] = nil
+		cx:toast("error", "Worktrees host half isn't ready", "Run tern plugin list to see why")
+	end
+end
+
 -- Opens the `new` dialog; `on_create(cx, branch, base)` runs on submit.
 function app.dialog(cx: WindowCx, ctx: { [string]: any }, on_create: (WindowCx, string, string) -> ())
 	local token = app.token(function(cx2, action, params)
@@ -124,6 +247,7 @@ function app.dialog(cx: WindowCx, ctx: { [string]: any }, on_create: (WindowCx, 
 	arg.token = token
 	arg.home = HOME
 	arg.bases = tern.json.array(ctx.bases)
+	arg.refs = tern.json.array(ctx.refs or ctx.bases)
 	if cx:new_block("worktrees.new", { tern.json.encode(arg) }, "below") == nil then
 		pending[token] = nil
 		cx:toast("error", "Worktrees host half isn't ready", "Run tern plugin list to see why")
@@ -153,7 +277,13 @@ function app.link(link: LinkRequest, cx: WindowCx): RouteDecision?
 	local token = params.token
 	local p = if token then pending[token] else nil
 	if p == nil or token == nil then
-		-- Another window's dialog, an expired one, or a link from elsewhere.
+		-- An expired dialog, one whose window VM a plugin reload replaced, or
+		-- a link from elsewhere. Saying nothing looks like the command simply
+		-- failed, so name it — but only for our own dialogs' actions, and
+		-- never for a cancel, which wanted nothing to happen anyway.
+		if DIALOG_ACTIONS[action] then
+			cx:toast("error", "That dialog has expired", "Run the command again (a plugin reload closes open dialogs)")
+		end
 		return { handled = true }
 	end
 	pending[token] = nil
@@ -167,6 +297,10 @@ end
 function app.run(id: string, cx: WindowCx, shared: Shared)
 	if id == "new" then
 		require("./flows/create").new(cx, shared)
+	elseif id == "quick" then
+		require("./flows/create").quick(cx, shared)
+	elseif id == "addrepo" or id == "rmrepo" or id == "setbase" then
+		(require("./flows/registry") :: any)[id](cx, shared)
 	else
 		local manage = require("./flows/manage")
 		local fn = (manage :: any)[id]

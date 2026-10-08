@@ -37,11 +37,15 @@ end
 
 local COMMANDS = {
 	{ id = "new", title = "New worktree session…", icon = "plus" },
+	{ id = "quick", title = "Quick worktree…", icon = "sparkle" },
 	{ id = "open", title = "Open worktree…", icon = "folder" },
 	{ id = "adopt", title = "Bind this session to its worktree", icon = "link" },
 	{ id = "setup", title = "Re-run setup", icon = "play" },
 	{ id = "remove", title = "Remove worktree…", icon = "trash" },
 	{ id = "prune", title = "Prune worktrees", icon = "broom" },
+	{ id = "addrepo", title = "Add repo…", icon = "folder" },
+	{ id = "rmrepo", title = "Remove repo…", icon = "trash" },
+	{ id = "setbase", title = "Set default base…", icon = "branch" },
 }
 
 for _, c in COMMANDS do
@@ -57,10 +61,18 @@ for _, c in COMMANDS do
 	})
 end
 
--- Carly exports `create` and `list` (desktop only: `tern.carly` is absent
--- elsewhere). Their logic loads on first call.
+-- Carly exports `create`, `list`, `repos` and `add_repo` (desktop only:
+-- `tern.carly` is absent elsewhere). Their logic loads on first call.
 if tern.carly ~= nil and not IOS then
 	require("./lib/carly").register(shared)
+end
+
+-- New tabs and splits inside a worktree session start in the worktree, not
+-- wherever Tern's new-tab preference points (Home by default).
+if not IOS then
+	require("./lib/anchor").register(function()
+		return index
+	end)
 end
 
 tern.route.link(function(link: LinkRequest, cx: WindowCx): RouteDecision?

@@ -17,3 +17,8 @@ palette = false
 id = "pick"
 title = "Worktrees"
 palette = false
+
+[[blocks]]
+id = "line"
+title = "Worktrees"
+palette = false

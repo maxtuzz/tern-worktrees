@@ -1,12 +1,14 @@
 --!strict
 -- worktrees, host half: the dialog blocks the window half opens (new
--- worktree, pick a worktree) and the spawn filter that gives shells started
--- inside a tracked worktree TERN_WT_ROOT, TERN_WT_MAIN and TERN_WT_BRANCH.
+-- worktree, pick a worktree, one line of quick entry) and the spawn filter
+-- that gives shells started inside a tracked worktree TERN_WT_ROOT,
+-- TERN_WT_MAIN and TERN_WT_BRANCH.
 
 local util = require("./lib/util")
 
 tern.block.define("new", require("./lib/blocks/new"))
 tern.block.define("pick", require("./lib/blocks/pick"))
+tern.block.define("line", require("./lib/blocks/line"))
 
 -- Tracked worktrees as {path, main, branch}, deepest path first. Rebuilt
 -- from `tern.kv` only when the store changes: `tern.kv.get` re-reads
