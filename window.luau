@@ -67,6 +67,14 @@ if tern.carly ~= nil and not IOS then
 	require("./lib/carly").register(shared)
 end
 
+-- New tabs and splits inside a worktree session start in the worktree, not
+-- wherever Tern's new-tab preference points (Home by default).
+if not IOS then
+	require("./lib/anchor").register(function()
+		return index
+	end)
+end
+
 tern.route.link(function(link: LinkRequest, cx: WindowCx): RouteDecision?
 	if string.sub(link.url, 1, 17) ~= "tern-worktrees://" then
 		return nil

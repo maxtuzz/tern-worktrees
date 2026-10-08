@@ -20,6 +20,7 @@ stub.registered = {
 	events = {} :: { [string]: { any } },
 	links = {} :: { any },
 	exports = {} :: { [string]: any },
+	overrides = {} :: { [string]: any },
 	status = nil :: any,
 }
 stub.processes = {} :: { any }
@@ -146,6 +147,9 @@ local tern: any = {
 		table.insert(stub.registered.commands, def)
 	end,
 	bind = function(_c, _a) end,
+	override = function(id, fn)
+		stub.registered.overrides[id] = fn
+	end,
 	route = {
 		open = function(_fn) end,
 		link = function(fn)
@@ -195,7 +199,7 @@ end
 -- A window cx with one session and one shell pane; records toasts, typed
 -- text and created sessions.
 function stub.window_cx(cwd: string?): any
-	local cx: any = { toasts = {}, typed = {}, created = {}, blocks = {} }
+	local cx: any = { toasts = {}, typed = {}, created = {}, blocks = {}, launched = {} }
 	local sessions = { { id = 1, name = "Default", host = 0, current = true, locked = false, tabs = 1 } }
 	cx.sessions = {
 		list = function(_self)
@@ -242,6 +246,18 @@ function stub.window_cx(cwd: string?): any
 		table.insert(self.typed, { pane = pane, text = text })
 	end
 	function cx:action(_name) end
+	cx.layout = {
+		new_tab = function(_self, launch, _reveal)
+			table.insert(cx.launched, { kind = "tab", launch = launch })
+			return 200 + #cx.launched
+		end,
+		split = function(_self, target, dir, launch, _reveal)
+			table.insert(cx.launched, { kind = "split", target = target, dir = dir, launch = launch })
+			return 200 + #cx.launched
+		end,
+		close = function(_self, _pane) end,
+		focus = function(_self, _pane) end,
+	}
 	function cx:new_block(kind, args, how)
 		table.insert(self.blocks, { kind = kind, args = args, how = how })
 		return 99

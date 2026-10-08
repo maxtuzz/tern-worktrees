@@ -650,6 +650,39 @@ test("window half registers its commands, a link route and a status segment", fu
 	eq(stub.registered.links[1]({ url = "https://example.com", mods = {} }, {}), nil)
 end)
 
+test("new tabs and splits in a worktree session start in the worktree", function()
+	local anchor = require("../lib/anchor")
+	state.put({ path = "/w/feat-z", main = "/m", repo = "m", branch = "feat/z", session_name = "m:feat/z" })
+	-- `window_start` re-reads the index the overrides read.
+	stub.registered.events.window_start[1]({ session = { focused = function() return nil end } })
+
+	-- A pane that wandered off to ~ in a worktree session still anchors,
+	-- because the session binding decides, not the focused pane's cwd.
+	local cx = stub.window_cx("/Users/me")
+	cx.sessions.current = function(_self)
+		return { id = 1, name = "m:feat/z", host = 0, current = true, locked = false, tabs = 1 }
+	end
+	eq(stub.registered.overrides.new_tab(cx), true)
+	eq(cx.launched[1].launch.cwd, "/w/feat-z")
+	eq(stub.registered.overrides.split_right(cx), true)
+	eq(cx.launched[2].kind, "split")
+	eq(cx.launched[2].dir, "right")
+	eq(cx.launched[2].launch.cwd, "/w/feat-z")
+	eq(stub.registered.overrides.split_down(cx) , true)
+	eq(cx.launched[3].dir, "down")
+
+	-- An ordinary session is left entirely alone.
+	local plain = stub.window_cx("/Users/me")
+	eq(stub.registered.overrides.new_tab(plain), nil, "Tern's own behavior runs")
+	eq(#plain.launched, 0)
+
+	-- Falling back to the focused pane when the session name doesn't match.
+	local by_cwd = stub.window_cx("/w/feat-z/app")
+	eq(stub.registered.overrides.new_tab(by_cwd), true)
+	eq(by_cwd.launched[1].launch.cwd, "/w/feat-z")
+	state.drop("/w/feat-z")
+end)
+
 test("status segment shows the branch inside a tracked worktree", function()
 	state.put({ path = "/w/feat-y", main = "/m", repo = "m", branch = "feat/y", session_name = "m:feat/y" })
 	-- `window_start` re-reads the index from kv.

@@ -144,6 +144,12 @@ await(plugins.worktrees.add_repo("~/dev/studio-gsm", "studio", "dev"))
 
 The status line shows `⎇ branch` for panes inside a tracked worktree, followed by `●n` when there are uncommitted changes. Click it to open the worktree list. Shells started inside a tracked worktree get `TERN_WT_ROOT`, `TERN_WT_MAIN` and `TERN_WT_BRANCH`.
 
+### New tabs and splits stay in the worktree
+
+`cx.sessions:create({name, cwd})` sets only *the first tab's* directory, and every tab after that follows Tern's new-tab Home preference — so a second terminal in a worktree session would open in `~`. Inside a tracked worktree session the plugin overrides **New tab**, **Split right** and **Split down** to launch at the worktree root instead. Which worktree comes from the session↔worktree binding first and the focused pane's directory second, so a pane that has wandered off to `~` still opens the next one in the right place.
+
+Outside a tracked worktree session the overrides do nothing and Tern's own behaviour runs untouched.
+
 ### Safety
 
 - The main worktree is never removed.

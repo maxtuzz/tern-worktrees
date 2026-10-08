@@ -107,6 +107,7 @@ Suggestions are capped at 500 — studio has 1797 refs, which is ~37 KiB of laun
 - After create: `cx.session:settle(pane)` then type setup script into the pane
 - Status segment: `⎇ branch ●n`
 - `available` false on iOS
+- `tern.override` on `new_tab`, `split_right`, `split_down`: `sessions:create` sets only the first tab's cwd, so later tabs follow Tern's new-tab Home preference and leave the worktree. Inside a tracked session they relaunch through `cx.layout:new_tab`/`:split` with the worktree as `cwd`; elsewhere they return nil and the built-in runs. The anchor is the session↔worktree binding first, the focused pane second — a pane already sitting in `~` shouldn't breed more of them.
 
 ### Carly exports (window half, desktop)
 
