@@ -82,9 +82,20 @@ The same block, with grammar `repo`, collects **Add repo…**'s `<path> [as <ali
 
 ### Bases
 
-Order: the typed base, the repository's registered default, the first existing configured `base`, the current branch, `HEAD`. A bare name resolves to `origin/<name>` when only the remote ref exists, so `off dev` works in a repo that never checked `dev` out.
+Order: the typed base → the repository's registered default → its trunk (`origin/HEAD`) → the configured `base` list → the current branch → `HEAD`. A bare name resolves to `origin/<name>` when only the remote ref exists, so `off dev` works in a repo that never checked `dev` out.
 
-When the chosen base is `origin/<branch>` and the branch is new, `git fetch --quiet origin <branch>` runs first with an 8 s limit. Failure is never fatal: creation continues from the local ref and the reported line says so. Only `origin`, and never `origin/HEAD`.
+**The trunk, not a guess at `main`.** `refs/remotes/origin/HEAD` is the repository's own statement of which branch is its trunk, so a repo whose trunk is `dev` needs no configuration. Two traps, both hit in practice:
+
+- its `%(refname:short)` is `origin`, not `origin/HEAD`, so the row is found by full refname and left out of the ref set (it is an alias for its target, which is listed in its own right);
+- an explicit `base` in `.tern/worktrees.json` is a decision and outranks it, while the built-in fallback list is only a guess and doesn't — hence `config.base_configured`.
+
+When the chosen base is `origin/<branch>` and the branch is new, `git fetch --quiet origin <branch>` runs first with an 8 s limit. Failure is never fatal: creation continues from the local ref and the reported line says so. Only `origin`.
+
+### The base field
+
+Free text, not a fixed list: the MVP's four-row picker was a dead end in any repo whose trunk isn't `main`. The field filters the suggestions as you type, ↑↓ writes the highlighted ref into it, and whatever it holds is what gets used — so a ref the suggestions left out is still reachable. It starts **empty** (blank means the best base, which the placeholder and preview name); prefilling it with an exact ref would have to be cleared before typing could filter anything.
+
+Suggestions are capped at 500 — studio has 1797 refs, which is ~37 KiB of launch argument — and remote-tracking refs come first, because one alphabetical list buries `origin/dev` at position 949. The dialog says how many it is showing rather than look complete.
 
 ## Architecture
 

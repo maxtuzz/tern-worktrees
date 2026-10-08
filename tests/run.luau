@@ -513,6 +513,66 @@ test("dialog block hands branch and base back as a tokened link", function()
 	eq(params.base, "HEAD")
 end)
 
+test("dialog's base field takes any ref, and filters the list as you type", function()
+	local dialog = stub.registered.blocks.new
+	local cx = stub.block_cx()
+	local s = dialog.init(cx, { tern.json.encode({
+		token = "t",
+		repo = "studio",
+		main = "/src/studio",
+		root = "../{repo}.worktrees/{slug}",
+		prefix = "",
+		session_name = "{repo}:{branch}",
+		bases = { "origin/dev", "origin/main", "HEAD" },
+		refs = { "origin/dev", "origin/main", "HEAD", "release/24.2", "feat/other" },
+	}) }, nil)
+	-- The field starts empty so the first keystroke filters; blank submits
+	-- the best base, which the placeholder and the preview name.
+	eq(s.base.text, "")
+	eq(s.focus, "branch")
+	dialog.view(s, cx)
+
+	-- Tab moves to the base field; typing filters to what matches.
+	dialog.key(s, stub.key("tab"), cx)
+	eq(s.focus, "base")
+	dialog.key(s, stub.key("paste", "rele"), cx)
+	dialog.view(s, cx)
+	dialog.key(s, stub.key("down"), cx)
+	eq(s.base.text, "release/24.2", "↑↓ writes the highlighted ref into the field")
+
+	-- A ref the suggestions never listed still goes through verbatim.
+	for _ = 1, #"release/24.2" do
+		dialog.key(s, stub.key("backspace"), cx)
+	end
+	dialog.key(s, stub.key("paste", "dev"), cx)
+	dialog.view(s, cx)
+	dialog.key(s, stub.key("tab"), cx)
+	eq(s.focus, "branch", "Tab goes back to the branch field")
+	dialog.key(s, stub.key("paste", "feat/x"), cx)
+	dialog.key(s, stub.key("enter"), cx)
+	local action, params = url.parse(cx.opened[1])
+	eq(action, "create")
+	eq(params.branch, "feat/x")
+	eq(params.base, "dev", "the window resolves a bare name against origin")
+end)
+
+test("dialog with an untouched base submits the best one", function()
+	local dialog = stub.registered.blocks.new
+	local cx = stub.block_cx()
+	local s = dialog.init(cx, { tern.json.encode({
+		token = "t",
+		repo = "studio",
+		main = "/src/studio",
+		root = "../{slug}",
+		prefix = "",
+		bases = { "origin/dev", "origin/main", "HEAD" },
+	}) }, nil)
+	dialog.view(s, cx)
+	dialog.key(s, stub.key("paste", "feat/x"), cx)
+	dialog.key(s, stub.key("enter"), cx)
+	eq(select(2, url.parse(cx.opened[1])).base, "origin/dev")
+end)
+
 test("dialog refuses invalid branch names", function()
 	local dialog = stub.registered.blocks.new
 	local cx = stub.block_cx()
@@ -696,17 +756,81 @@ test("a typed base falls back to its origin ref, and defaults are ordered", func
 	local cfg = config.normalize({ base = { "origin/main", "main" } })
 	eq(create.pick_base("dev", refs, cfg, nil), "origin/dev")
 	eq(create.pick_base("", refs, cfg, nil), "origin/main", "first configured base that exists")
-	eq(create.pick_base("", refs, cfg, "dev"), "origin/dev", "the repo's default base comes first")
+	eq(create.pick_base("", refs, cfg, { prefer = "dev" }), "origin/dev", "the repo's default base comes first")
 	eq(create.pick_base("", { x = true }, cfg, nil), "HEAD")
-	eq(create.pick_base("", refs, cfg, "gone"), "origin/main", "a default base that no longer exists is skipped")
-	eq(table.concat(create.bases(cfg, refs, "feat/x", "dev"), ","), "origin/dev,origin/main,main,feat/x,HEAD")
-	eq(table.concat(create.bases(cfg, refs, nil, "gone"), ","), "origin/main,main,HEAD")
+	eq(create.pick_base("", refs, cfg, { prefer = "gone" }), "origin/main", "a default base that no longer exists is skipped")
+	eq(
+		table.concat(create.bases(cfg, refs, { current = "feat/x", prefer = "dev" }), ","),
+		"origin/dev,origin/main,main,feat/x,HEAD"
+	)
+	eq(table.concat(create.bases(cfg, refs, { prefer = "gone" }), ","), "origin/main,main,HEAD")
 
 	eq(create.fetch_spec("origin/dev"), "dev")
 	eq(create.fetch_spec("origin/feat/x"), "feat/x")
 	eq(create.fetch_spec("main"), nil, "local refs aren't fetched")
 	eq(create.fetch_spec("upstream/dev"), nil, "only origin")
 	eq(create.fetch_spec("origin/HEAD"), nil)
+end)
+
+test("the repository's own trunk beats a guess at main, but not an explicit base", function()
+	local create = require("../lib/flows/create")
+	local config = require("../lib/config")
+
+	-- `origin/HEAD -> origin/dev` is how a repo states its trunk. Its short
+	-- name is `origin`, not `origin/HEAD`, so it is read by full refname.
+	local refs, head, remote = create.parse_refs(table.concat({
+		"refs/heads/main\tmain\t",
+		"refs/heads/feat/x\tfeat/x\t",
+		"refs/remotes/origin/main\torigin/main\t",
+		"refs/remotes/origin/dev\torigin/dev\t",
+		"refs/remotes/origin/HEAD\torigin\torigin/dev",
+	}, "\n"))
+	eq(head, "origin/dev")
+	eq(refs["origin/dev"], true)
+	eq(refs["origin"], nil, "the trunk pointer is an alias, not a base")
+	eq(remote["origin/dev"], true)
+	eq(remote["feat/x"], nil, "a local branch can hold a slash too")
+	eq(refs["feat/x"], true)
+
+	-- A bare listing still yields its refs rather than nothing.
+	local plain, plain_head = create.parse_refs("main\norigin/main\n")
+	eq(plain.main, true)
+	eq(plain["origin/main"], true)
+	eq(plain_head, nil)
+
+	-- No `.tern/worktrees.json`: the default base list is only a guess, so
+	-- the trunk leads. This is the "my main branch is dev" case.
+	local guessed = config.normalize(nil)
+	eq(guessed.base_configured, false)
+	eq(create.pick_base("", refs, guessed, { remote_head = head }), "origin/dev")
+	eq(
+		table.concat(create.bases(guessed, refs, { current = "feat/x", remote_head = head }), ","),
+		"origin/dev,origin/main,main,feat/x,HEAD"
+	)
+
+	-- An explicit list is a decision, so it outranks the trunk.
+	local chosen = config.normalize({ base = { "origin/main" } })
+	eq(chosen.base_configured, true)
+	eq(create.pick_base("", refs, chosen, { remote_head = head }), "origin/main")
+	eq(table.concat(create.bases(chosen, refs, { remote_head = head }), ","), "origin/main,origin/dev,HEAD")
+
+	-- A registered default base still beats both.
+	eq(create.pick_base("", refs, chosen, { prefer = "dev", remote_head = head }), "origin/dev")
+end)
+
+test("base suggestions put the ranked choices first, then remotes, then local", function()
+	local create = require("../lib/flows/create")
+	local refs = { ["origin/dev"] = true, ["origin/zoo"] = true, main = true, zebra = true, apple = true }
+	local remote = { ["origin/dev"] = true, ["origin/zoo"] = true }
+	-- Remotes before local branches: one alphabetical list buries origin/*
+	-- behind hundreds of local branches (studio has 660 of them).
+	eq(table.concat(create.suggestions({ "origin/dev", "HEAD" }, refs, remote), ","), "origin/dev,HEAD,origin/zoo,apple,main,zebra")
+	eq(#create.suggestions({ "origin/dev" }, refs, remote, 3), 3, "the rest is capped")
+	eq(
+		table.concat(create.suggestions({ "HEAD" }, refs, nil), ","),
+		"HEAD,apple,main,origin/dev,origin/zoo,zebra",
+		"no remote set: one list"
+	)
 end)
 
 -- the known-repos store ----------------------------------------------------
@@ -916,6 +1040,86 @@ test("New worktree from outside a repo picks a repository, then opens the dialog
 	eq(dialog.bases[1], "origin/dev", "the registered default base leads")
 	eq(#stub.processes, 0)
 	stub.kv.repos = nil
+end)
+
+test("a repo whose trunk is dev offers dev first, with no configuration at all", function()
+	local app = require("../lib/app")
+	stub.processes = {}
+	stub.kv.repos = nil
+	stub.files["/src/studio/.tern/worktrees.json"] = nil
+	local cx = stub.window_cx("/src/studio")
+	app.run("new", cx, { reload = function() end })
+	stub.answer(cx, 0, "/src/studio\n/src/studio/.git\n")
+	stub.answer(cx, 0, "worktree /src/studio\nHEAD abc\nbranch refs/heads/feat/brief\n")
+	stub.answer(cx, 0, table.concat({
+		"refs/heads/feat/brief\tfeat/brief\t",
+		"refs/heads/main\tmain\t",
+		"refs/remotes/origin/main\torigin/main\t",
+		"refs/remotes/origin/dev\torigin/dev\t",
+		"refs/remotes/origin/HEAD\torigin\torigin/dev",
+		"refs/remotes/origin/release\torigin/release\t",
+	}, "\n"))
+	local dialog = stub.last_block(cx)
+	eq(table.concat(dialog.bases, ","), "origin/dev,origin/main,main,feat/brief,HEAD")
+	eq(dialog.refs[1], "origin/dev", "suggestions lead with the ranked choices")
+	eq(table.find(dialog.refs, "origin/release") ~= nil, true, "every other ref is suggested too")
+	eq(table.find(dialog.refs, "origin"), nil, "the trunk pointer isn't offered as a base")
+	eq(#stub.processes, 0)
+end)
+
+-- Palette → dialog → link → git, with the real block driving the link.
+test("the whole New worktree path creates a worktree and its session", function()
+	local app = require("../lib/app")
+	local dialog = stub.registered.blocks.new
+	stub.processes = {}
+	stub.kv.repos = nil
+	stub.kv.autoname_cursor = nil
+	local cx = stub.window_cx("/src/studio")
+	app.run("new", cx, { reload = function() end })
+	stub.answer(cx, 0, "/src/studio\n/src/studio/.git\n")
+	stub.answer(cx, 0, "worktree /src/studio\nHEAD abc\nbranch refs/heads/feat/brief\n")
+	stub.answer(cx, 0, table.concat({
+		"refs/heads/feat/brief\tfeat/brief\t",
+		"refs/remotes/origin/dev\torigin/dev\t",
+		"refs/remotes/origin/main\torigin/main\t",
+		"refs/remotes/origin/HEAD\torigin\torigin/dev",
+	}, "\n"))
+
+	-- The host half's block, on the argument the window actually sent.
+	local block_cx = stub.block_cx()
+	local s = dialog.init(block_cx, { (cx.blocks[#cx.blocks].args)[1] }, nil)
+	dialog.view(s, block_cx)
+	dialog.key(s, stub.key("paste", "feat/login"), block_cx)
+	dialog.key(s, stub.key("enter"), block_cx)
+	eq(#block_cx.opened, 1, "Enter opened a link")
+
+	-- …and the link it opened, back through the window's route.
+	app.link({ url = block_cx.opened[1], mods = {} }, cx)
+	local argv = stub.answer(cx, 0, "feat/brief\norigin/dev\norigin/main\n") -- for-each-ref
+	eq(argv[4], "for-each-ref")
+	argv = stub.answer(cx, 0) -- check-ref-format
+	eq(argv[#argv], "feat/login")
+	stub.answer(cx, 1) -- rev-parse: the branch is new
+	argv = stub.answer(cx, 0) -- fetch the base
+	eq(table.concat(argv, " "), "git -C /src/studio fetch --quiet origin dev")
+	argv = stub.answer(cx, 0) -- worktree add
+	eq(table.concat(argv, " "), "git -C /src/studio worktree add --no-track -b feat/login /src/studio.worktrees/feat-login origin/dev")
+	eq(cx.created[1].name, "studio:feat/login", "the session opened")
+	eq(cx.created[1].cwd, "/src/studio.worktrees/feat-login")
+	eq(#stub.processes, 0)
+	state.drop("/src/studio.worktrees/feat-login")
+	stub.kv.repos = nil
+end)
+
+test("a link whose dialog outlived its window says so instead of doing nothing", function()
+	local app = require("../lib/app")
+	stub.processes = {}
+	local cx = stub.window_cx("/src/studio")
+	-- A token this window never issued: an expired dialog, or one from the
+	-- window VM a plugin reload replaced.
+	app.link({ url = url.build("create", { token = "stale", branch = "x", base = "HEAD" }), mods = {} }, cx)
+	eq(#stub.processes, 0, "nothing ran")
+	eq(cx.toasts[#cx.toasts].text, "That dialog has expired")
 end)
 
 test("with nothing known and nowhere to look, New worktree says what to do", function()

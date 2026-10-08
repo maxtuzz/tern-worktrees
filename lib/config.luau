@@ -12,6 +12,10 @@ export type Config = {
 	root: string,
 	branch_prefix: string,
 	base: { string },
+	-- Whether `base` was set in the file. The default list is only a guess,
+	-- so the repository's own trunk (origin/HEAD) outranks it; an explicit
+	-- list outranks the trunk.
+	base_configured: boolean,
 	fetch_before_create: boolean,
 	session_name: string,
 	post_open_actions: { string },
@@ -50,6 +54,7 @@ local function defaults(): Config
 		root = "../{repo}.worktrees/{slug}",
 		branch_prefix = "",
 		base = { "origin/main", "origin/master", "main", "master" },
+		base_configured = false,
 		fetch_before_create = false,
 		session_name = "{repo}:{branch}",
 		post_open_actions = {},
@@ -223,6 +228,7 @@ function config.normalize(raw: any, source: string?): Config
 	cfg.branch_prefix = string_or(raw.branch_prefix, cfg.branch_prefix, "branch_prefix")
 	if raw.base ~= nil then
 		cfg.base = string_list(raw.base, "base")
+		cfg.base_configured = true
 	end
 	if raw.fetch_before_create ~= nil then
 		if type(raw.fetch_before_create) ~= "boolean" then

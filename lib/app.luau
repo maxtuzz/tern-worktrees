@@ -18,6 +18,16 @@ export type Shared = {
 	reload: () -> (),
 }
 
+-- The actions our own dialog blocks answer with, so a link that finds no
+-- live token can be told apart from any other `tern-worktrees://` URL.
+local DIALOG_ACTIONS: { [string]: boolean } = {
+	create = true,
+	pick = true,
+	quick = true,
+	addrepo = true,
+	setbase = true,
+}
+
 type Handler = (cx: WindowCx, action: string, params: { [string]: string }) -> ()
 local pending: { [string]: { at: number, on: Handler } } = {}
 local seq = 0
@@ -237,6 +247,7 @@ function app.dialog(cx: WindowCx, ctx: { [string]: any }, on_create: (WindowCx, 
 	arg.token = token
 	arg.home = HOME
 	arg.bases = tern.json.array(ctx.bases)
+	arg.refs = tern.json.array(ctx.refs or ctx.bases)
 	if cx:new_block("worktrees.new", { tern.json.encode(arg) }, "below") == nil then
 		pending[token] = nil
 		cx:toast("error", "Worktrees host half isn't ready", "Run tern plugin list to see why")
@@ -266,7 +277,13 @@ function app.link(link: LinkRequest, cx: WindowCx): RouteDecision?
 	local token = params.token
 	local p = if token then pending[token] else nil
 	if p == nil or token == nil then
-		-- Another window's dialog, an expired one, or a link from elsewhere.
+		-- An expired dialog, one whose window VM a plugin reload replaced, or
+		-- a link from elsewhere. Saying nothing looks like the command simply
+		-- failed, so name it — but only for our own dialogs' actions, and
+		-- never for a cancel, which wanted nothing to happen anyway.
+		if DIALOG_ACTIONS[action] then
+			cx:toast("error", "That dialog has expired", "Run the command again (a plugin reload closes open dialogs)")
+		end
 		return { handled = true }
 	end
 	pending[token] = nil

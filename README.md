@@ -25,7 +25,7 @@ Open the palette anywhere. **New worktree session…**, **Quick worktree…** an
 
 | Command | What it does |
 | --- | --- |
-| **New worktree session…** | Opens a dialog for the branch name and base. Leave the branch blank to get the next free autoname (see below). Runs `git worktree add` at `../{repo}.worktrees/{slug}`, opens a Tern session named `{repo}:{branch}` in it, and types the `post_create` setup into its first pane. If the branch already exists, the existing branch is checked out. If the branch already has a worktree, that worktree's session opens. The repository is the focused pane's when it is in one, otherwise you pick from the [known repos](#known-repos). |
+| **New worktree session…** | Opens a dialog for the branch name and base. Leave the branch blank to get the next free autoname (see below); the base field takes any ref, or part of one to filter the list. Runs `git worktree add` at `../{repo}.worktrees/{slug}`, opens a Tern session named `{repo}:{branch}` in it, and types the `post_create` setup into its first pane. If the branch already exists, the existing branch is checked out. If the branch already has a worktree, that worktree's session opens. The repository is the focused pane's when it is in one, otherwise you pick from the [known repos](#known-repos). |
 | **Quick worktree…** | One line: `[repo] [branch] [off <base>]`. See [quick entry](#quick-entry). |
 | **Open worktree…** | Lists the repository's worktrees. Picking one switches to its session, or creates the session if there isn't one. |
 | **Bind this session to its worktree** | Binds the current session to the focused pane's worktree. Use it for worktrees you made by hand. |
@@ -86,7 +86,18 @@ The dialog previews what the line resolves to while you type. The window parses 
 
 ### Bases
 
-A new branch starts at the first of these that exists: the base on the quick-entry line or in the dialog, the repository's registered default base, the first existing `base` from `.tern/worktrees.json`, the current branch, `HEAD`.
+A new branch starts at the first of these that exists:
+
+1. the base typed on the quick-entry line or in the dialog;
+2. the repository's registered default base (**Set default base…**);
+3. **the repository's own trunk** — whatever `refs/remotes/origin/HEAD` points at — when `.tern/worktrees.json` doesn't name a `base`;
+4. the first existing `base` from `.tern/worktrees.json` (whose default is `["origin/main", "origin/master", "main", "master"]`);
+5. the current branch;
+6. `HEAD`.
+
+Step 3 is why a repo whose trunk is `dev` offers `origin/dev` first with no configuration at all. An explicit `base` list in `.tern/worktrees.json` is a decision, so it outranks the trunk; the built-in fallback list is only a guess, so it doesn't. (`git clone` sets `origin/HEAD`; `git remote set-head origin -a` fixes it if it's missing or stale.)
+
+The dialog's **base field takes free text**: type any ref, or part of one to filter the list below, and ↑↓ writes the highlighted ref into the field. Leave it blank for the best base. Repositories with thousands of refs only get the first 500 as suggestions — remote-tracking refs first, since one alphabetical list buries `origin/dev` behind hundreds of local branches — and the dialog says so. Anything past the cap still works if you type it in full.
 
 When that base is `origin/<branch>`, the plugin runs `git fetch --quiet origin <branch>` first, with an 8-second limit, so the new branch starts from what the remote has now. Offline is fine: creation goes ahead from the local ref and the reported line says `couldn't fetch origin/dev, used the local ref`. Only `origin` is fetched this way — no other remote, and never `origin/HEAD`. Set `fetch_before_create: true` for the full `git fetch --prune` instead.
 
@@ -159,7 +170,7 @@ Put this file in the main worktree. Every key is optional:
 ```
 
 - `root` is resolved against the main worktree and must contain `{slug}` or `{branch}`. `{slug}` is the branch name with `/` and other unsafe characters turned into `-`.
-- `base` lists the bases the dialog offers. Refs that don't exist are hidden, and the repository's registered default base, the current branch and `HEAD` are always offered.
+- `base` lists the bases the dialog ranks first. Refs that don't exist are hidden, and the repository's registered default base, the current branch and `HEAD` are always offered. Setting it also tells the plugin you've chosen deliberately, so it outranks `origin/HEAD`; leave it out and the repository's own trunk leads.
 - New branches are created with `--no-track`, so they never push to their base by accident.
 - `post_open_actions` are action ids run once the session opens. Ids that no installed plugin provides are skipped, so `plugin.branch-changes.open` is safe to list without that plugin.
 
@@ -212,7 +223,7 @@ Steps compile to one bash script in the plugin's data folder. It runs in the ses
 
 - **Window half** (`window.luau`): registers the palette commands, the Carly exports, the `tern-worktrees://` link route and the status segment. Its load requires only `lib/state`, and the rest loads on first use, which keeps it inside the 50 ms budget. All git runs through async `tern.process.run`.
 - **Host half** (`host.luau`): provides the dialog blocks `worktrees.new`, `worktrees.pick` and `worktrees.line`, and the `spawn` filter. The filter only reads an in-memory index refreshed from `tern.kv`, and never runs git.
-- **Dialog → window**: a block answers with `cx:open("tern-worktrees://create?token=…")`, and the window's `tern.route.link` handles it. Each dialog carries a one-shot token issued by the window. A link without a live token does nothing, so a clicked link in terminal output can't create or remove anything.
+- **Dialog → window**: a block answers with `cx:open("tern-worktrees://create?token=…")`, and the window's `tern.route.link` handles it. Each dialog carries a one-shot token issued by the window. A link without a live token does nothing, so a clicked link in terminal output can't create or remove anything. Tokens live in the window's VM, so **`tern plugin reload` invalidates any dialog left open**: answering one then toasts "That dialog has expired" rather than failing silently.
 - **State**: `tern.kv` key `worktrees` maps each worktree path to `{session_name, session_id, branch, main, …}`. Sessions are found again by name after a daemon restart. Key `repos` holds the known-repos registry, overlaid with `repos.json`.
 - **Pure modules**: `lib/repos` (registry rules), `lib/quick` (both one-line grammars), `lib/util`, `lib/autoname` and `config.normalize` call no `tern` API, so `tests/run.sh` exercises them under plain `luau`.
 
@@ -231,7 +242,8 @@ tern plugin types .   # regenerate tern.d.luau after upgrading Tern
 - Removal keeps the branch. Deleting it is not offered yet.
 - Tern's palette has no inline argument entry (`tern.command` is `{id, title, icon, group, keys, available, run}`), so quick entry is a one-line dialog rather than something you type into the palette row itself.
 - Known repos can't be declared in Tern's `settings.json`: there is no plugin-settings schema API. `repos.json` in the plugin data directory is the stand-in.
-- The targeted pre-create fetch only knows `origin`. A repo whose base lives on another remote still creates, from the local ref.
+- The targeted pre-create fetch only knows `origin`, and the trunk is read from `origin/HEAD` for the same reason. A repo whose trunk lives on another remote falls back to the configured `base` list.
+- A repository with more than 500 refs only gets the first 500 as base suggestions. Typing a ref in full always works.
 
 ## Docs
 

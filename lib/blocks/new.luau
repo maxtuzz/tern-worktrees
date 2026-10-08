@@ -19,19 +19,27 @@ type Ctx = {
 	root: string, -- path template, relative to main
 	prefix: string,
 	session_name: string, -- session name template
-	bases: { string },
+	bases: { string }, -- the ranked choices; bases[1] is the default
+	refs: { string }, -- those plus every other ref, as suggestions
+	ref_total: number?, -- how many the repository has, when `refs` is capped
 	home: string?,
 }
 
 type State = {
 	ctx: Ctx,
 	branch: field.Field,
-	base: number,
+	-- The base is free text: the list below is navigation, not the answer, so
+	-- a ref the suggestions left out is still reachable by typing it.
+	base: field.Field,
+	focus: string, -- "branch" or "base"
 	problem: string?,
 	submitted: boolean,
 }
 
-local INPUT_ID = "main.branch"
+local BRANCH_ID = "main.branch"
+local BASE_ID = "main.base"
+-- Rendered rows; the list node scrolls within its own height.
+local LIST_MAX = 60
 
 local function decode_args(args: { string }): Ctx?
 	local ok, ctx = pcall(tern.json.decode, args[1] or "")
@@ -41,7 +49,68 @@ local function decode_args(args: { string }): Ctx?
 	if type(ctx.bases) ~= "table" or #ctx.bases == 0 then
 		ctx.bases = { "HEAD" }
 	end
+	if type(ctx.refs) ~= "table" or #ctx.refs == 0 then
+		ctx.refs = ctx.bases
+	end
 	return ctx
+end
+
+-- The refs the list shows, filtered by what the base field holds.
+local function listed(state: State): { string }
+	local text = util.trim(state.base.text)
+	local lower = string.lower(text)
+	-- An exact ref means "that one is chosen" (you arrowed to it or typed it
+	-- out), so the whole list stays up with it highlighted. Anything else is
+	-- a filter.
+	local exact = false
+	for _, ref in state.ctx.refs do
+		if ref == text then
+			exact = true
+			break
+		end
+	end
+	local out: { string } = {}
+	for _, ref in state.ctx.refs do
+		if text == "" or exact or string.find(string.lower(ref), lower, 1, true) then
+			table.insert(out, ref)
+			if #out >= LIST_MAX then
+				break
+			end
+		end
+	end
+	return out
+end
+
+-- The base that will be used: what was typed, else the best candidate.
+local function effective_base(state: State): string
+	local text = util.trim(state.base.text)
+	return if text ~= "" then text else (state.ctx.bases[1] or "HEAD")
+end
+
+-- The 1-based row the base field names, or 0.
+local function selected(state: State, list: { string }): number
+	local want = effective_base(state)
+	for i, ref in list do
+		if ref == want then
+			return i
+		end
+	end
+	return 0
+end
+
+-- Moves the highlight by `delta`, writing the ref into the base field so the
+-- field always shows what will be used.
+local function move(state: State, delta: number)
+	local list = listed(state)
+	if #list == 0 then
+		return
+	end
+	local at = selected(state, list)
+	local next_at = if at == 0
+		then (if delta > 0 then 1 else #list)
+		else (at - 1 + delta) % #list + 1
+	state.base = field.new(list[next_at])
+	state.problem = nil
 end
 
 local function full_branch(state: State): string
@@ -88,7 +157,8 @@ local function submit(state: State, cx: BlockCx)
 	finish(state, cx, url.build("create", {
 		token = state.ctx.token,
 		branch = branch,
-		base = state.ctx.bases[state.base] or "HEAD",
+		-- A bare name is resolved against origin by the window.
+		base = effective_base(state),
 	}))
 end
 
@@ -98,33 +168,40 @@ local function cancel(state: State, cx: BlockCx)
 	end
 end
 
-local function focus_input(cx: BlockCx)
+local function input_id(state: State): string
+	return if state.focus == "base" then BASE_ID else BRANCH_ID
+end
+
+local function focus_input(state: State, cx: BlockCx)
+	local id = input_id(state)
 	tern.timer(30, function()
-		cx:frame({ { "focus", INPUT_ID } })
+		cx:frame({ { "focus", id } })
 	end)
 end
 
-local function base_list(state: State): Node
+local function base_list(state: State, list: { string }): Node
+	local at = selected(state, list)
 	local items: { Item } = {}
-	for i, b in state.ctx.bases do
+	for i, ref in list do
 		items[i] = {
-			label = b,
-			icon = if i == state.base then "check" else nil,
-			tone = if i == state.base then "accent" else nil,
+			label = ref,
+			icon = if i == at then "check" else nil,
+			tone = if i == at then "accent" else nil,
 		}
 	end
-	local list = ui.list(items)
-	for i, child in list.c or {} do
+	local node = ui.list(items)
+	for i, child in node.c or {} do
 		local p: { [string]: any } = child.p or {}
 		p.key = "b" .. i
 		p.actions = { click = "base=" .. i }
 		child.p = p
 	end
-	list.p = list.p or {}
-	local lp: { [string]: any } = list.p :: any
+	node.p = node.p or {}
+	local lp: { [string]: any } = node.p :: any
 	lp.key = "bases"
-	lp.selected = "main.bases.b" .. state.base
-	return list
+	lp.selected = "main.bases.b" .. (if at > 0 then at else 1)
+	lp.max = { lines = 8 }
+	return node
 end
 
 local dialog: BlockDef<State> = {
@@ -133,14 +210,19 @@ local dialog: BlockDef<State> = {
 		if ctx == nil then
 			error("worktrees.new needs the window's launch argument; use \"New worktree session…\" from the palette", 0)
 		end
+		local kept = if type(saved) == "table" then saved else nil
 		local state: State = {
 			ctx = ctx :: Ctx,
-			branch = field.new(if type(saved) == "table" then saved.branch else nil),
-			base = if type(saved) == "table" and type(saved.base) == "number" then saved.base else 1,
+			branch = field.new(if kept then kept.branch else nil),
+			-- Empty, not prefilled with the default: a prefilled exact ref
+			-- would have to be cleared before typing could filter anything.
+			-- Blank means "the default", which the dock and preview name.
+			base = field.new(if kept and type(kept.base) == "string" then kept.base else nil),
+			focus = "branch",
 			problem = nil,
 			submitted = false,
 		}
-		focus_input(cx)
+		focus_input(state, cx)
 		return state
 	end,
 
@@ -150,6 +232,7 @@ local dialog: BlockDef<State> = {
 
 	view = function(state, _cx)
 		local branch = full_branch(state)
+		local base = effective_base(state)
 		local preview: { Node } = {}
 		if branch == "" then
 			preview = { ui.text({ ui.span("Blank branch: Enter creates the next free autoname (a sea creature).", "muted") }) }
@@ -157,6 +240,7 @@ local dialog: BlockDef<State> = {
 			preview = {
 				ui.kv({
 					{ { ui.span("branch", "muted") }, { ui.span(branch, "strong") } },
+					{ { ui.span("base", "muted") }, { ui.span(base) } },
 					{ { ui.span("path", "muted") }, { ui.span(util.tilde(target_path(state, branch), state.ctx.home)) } },
 					{ { ui.span("session", "muted") }, {
 						ui.span(util.render(state.ctx.session_name or "{repo}:{branch}", {
@@ -175,7 +259,12 @@ local dialog: BlockDef<State> = {
 				text = state.branch.text,
 				cursor = state.branch.cursor,
 				placeholder = "branch name, or leave blank for an autoname (manatee, murex…)",
-				prompt = { ui.span(if state.ctx.prefix ~= "" then state.ctx.prefix else "⎇ ", "muted") },
+				prompt = {
+					ui.span(
+						if state.ctx.prefix ~= "" then state.ctx.prefix else "⎇ ",
+						if state.focus == "branch" then "accent" else "muted"
+					),
+				},
 			}),
 		}
 		if state.problem then
@@ -184,8 +273,38 @@ local dialog: BlockDef<State> = {
 		for _, n in preview do
 			table.insert(children, n)
 		end
-		table.insert(children, ui.rule("Base (new branches start here)"))
-		table.insert(children, base_list(state))
+		local list = listed(state)
+		table.insert(children, ui.rule(
+			if state.focus == "base"
+				then "Base — type to filter, ↑↓ to pick"
+				else "Base (new branches start here) — Tab to change"
+		))
+		table.insert(children, ui.node("input", {
+			key = "base",
+			text = state.base.text,
+			cursor = state.base.cursor,
+			placeholder = state.ctx.bases[1] or "HEAD",
+			prompt = { ui.span("⎇ ", if state.focus == "base" then "accent" else "muted") },
+		}))
+		if #list == 0 then
+			table.insert(children, ui.text({
+				ui.span("No ref matches. " .. base .. " is used as typed", "warn"),
+				ui.span(" (a bare name resolves to origin/" .. base .. ").", "muted"),
+			}))
+		else
+			table.insert(children, base_list(state, list))
+			-- A big monorepo's refs don't all fit in the launch argument, so
+			-- say what the list leaves out rather than look complete.
+			local total = state.ctx.ref_total or 0
+			if total > #state.ctx.refs then
+				table.insert(children, ui.text({
+					ui.span(
+						string.format("Suggesting %d of %d refs — type any other in full.", #state.ctx.refs, total),
+						"muted"
+					),
+				}))
+			end
+		end
 		local create = ui.badge(if state.submitted then "Creating…" else "Create", "accent")
 		create.p = create.p or {}
 		local cp: { [string]: any } = create.p :: any
@@ -200,7 +319,7 @@ local dialog: BlockDef<State> = {
 				ui.row({
 					create,
 					close,
-					ui.text({ ui.span("Enter create · Tab/↑↓ base · Esc cancel", "muted") }),
+					ui.text({ ui.span("Enter create · Tab field · ↑↓ base · Esc cancel", "muted") }),
 				}),
 			}),
 		}
@@ -215,13 +334,14 @@ local dialog: BlockDef<State> = {
 			submit(state, cx)
 		elseif name == "escape" then
 			cancel(state, cx)
-		elseif name == "tab" or name == "down" then
-			state.base = if key.shift and name == "tab"
-				then (state.base - 2) % #state.ctx.bases + 1
-				else state.base % #state.ctx.bases + 1
+		elseif name == "tab" then
+			state.focus = if state.focus == "branch" then "base" else "branch"
+			focus_input(state, cx)
+		elseif name == "down" then
+			move(state, 1)
 		elseif name == "up" then
-			state.base = (state.base - 2) % #state.ctx.bases + 1
-		elseif field.key(state.branch, key) then
+			move(state, -1)
+		elseif field.key(if state.focus == "base" then state.base else state.branch, key) then
 			state.problem = nil
 		else
 			return false
@@ -231,14 +351,17 @@ local dialog: BlockDef<State> = {
 
 	event = function(state, ev, cx)
 		if ev.ev == "focus" then
-			cx:frame({ { "focus", INPUT_ID } })
+			cx:frame({ { "focus", input_id(state) } })
 		elseif ev.ev == "action" then
 			if ev.act == "base" then
-				local i = tonumber(ev.value)
-				if i and state.ctx.bases[i] then
-					state.base = i
+				local list = listed(state)
+				local ref = list[tonumber(ev.value) or 0]
+				if ref then
+					state.base = field.new(ref)
+					state.problem = nil
 				end
-				focus_input(cx)
+				state.focus = "branch"
+				focus_input(state, cx)
 			elseif ev.act == "create" then
 				submit(state, cx)
 			elseif ev.act == "cancel" then
@@ -248,7 +371,7 @@ local dialog: BlockDef<State> = {
 	end,
 
 	save = function(state)
-		return { branch = state.branch.text, base = state.base }
+		return { branch = state.branch.text, base = state.base.text }
 	end,
 }
 
